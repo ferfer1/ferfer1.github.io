@@ -38,7 +38,7 @@ import {
   getPlayback, runAction, PlaybackState, fmtTime, getPlaylists, controls,
   editablePlaylists, currentEditablePlaylist, addTrackToPlaylist,
 } from "../spotify-controller/spotify.js";
-import { LyricsTracker, lyricsEnabled, setLyricsEnabled } from "../spotify-controller/lyrics.js";
+import { LyricsTracker, lyricsEnabled, setLyricsEnabled, mountRomajiTools } from "../spotify-controller/lyrics.js";
 import {
   MAX_LISTEN_MS, getOpenAIKey, mountVoiceSettings, startBrowserRecording,
   pcmToWav, transcribe, findSongs,
@@ -726,6 +726,7 @@ async function init() {
   $("login-btn").onclick = login;
   $("logout").onclick = () => { logout(); location.reload(); };
   mountVoiceSettings($("voice-settings"));
+  mountRomajiTools($("romaji-tools"), () => playback.state);
   // "Menu height": − makes the button list shorter (use it if the bottom row is cut off).
   $("menu-shorter").onclick = () => changeMenuTrim(MENU_TRIM_STEP);
   $("menu-taller").onclick = () => changeMenuTrim(-MENU_TRIM_STEP);
