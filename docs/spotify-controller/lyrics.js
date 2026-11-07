@@ -117,34 +117,55 @@ async function japaneseToRomaji(text) {
 const OPENAI_CHAT = "https://api.openai.com/v1/chat/completions";
 const ROMAJI_MODELS = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-5-mini"]; // first available wins
 const ROMAJI_INSTRUCTIONS =
-  "You convert Japanese song lyrics to Hepburn romaji. You receive JSON {\"lines\": [...]}. " +
-  "Reply with JSON {\"lines\": [...]} containing exactly one romanized string per input line, in the same order. " +
-  "Use the correct readings for the song's context. Lowercase, words separated by spaces. " +
+  "You convert Japanese text to Hepburn romaji. You receive JSON {\"lines\": {\"1\": \"...\", \"2\": \"...\"}}. " +
+  "Reply with JSON {\"romaji\": {\"1\": \"...\", \"2\": \"...\"}} using exactly the same keys, one romanized " +
+  "string per key. Use the correct readings for the context. Lowercase, words separated by spaces. " +
   "Write long vowels with doubled letters (ou, uu, ei, aa) and never use macrons. " +
   "Keep English words and punctuation as they are. Never translate.";
+const ROMAJI_BATCH = 30;            // lines per request (long songs are split)
+const OPENAI_TIMEOUT_MS = 45000;    // never wait forever on a request
 
 const openAIKey = () => store.get("openai_key") || ""; // set in Voice search settings
 
-async function openAIRomaji(texts) {
+let romajiModel = null; // first model that worked, remembered for later requests
+
+/** One OpenAI request: { "1": text, ... } → { "1": romaji, ... } (keys may be missing). */
+async function openAIRomajiRequest(numbered) {
   let lastError;
-  for (const model of ROMAJI_MODELS) {
-    const res = await fetch(OPENAI_CHAT, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${openAIKey()}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        response_format: { type: "json_object" },
-        messages: [
-          { role: "system", content: ROMAJI_INSTRUCTIONS },
-          { role: "user", content: JSON.stringify({ lines: texts }) },
-        ],
-      }),
-    });
+  const models = romajiModel ? [romajiModel] : ROMAJI_MODELS;
+  for (const model of models) {
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), OPENAI_TIMEOUT_MS);
+    let res;
+    try {
+      res = await fetch(OPENAI_CHAT, {
+        method: "POST",
+        signal: abort.signal,
+        headers: { Authorization: `Bearer ${openAIKey()}`, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: ROMAJI_INSTRUCTIONS },
+            { role: "user", content: JSON.stringify({ lines: numbered }) },
+          ],
+        }),
+      });
+    } catch (e) {
+      throw new Error(e.name === "AbortError" ? "OpenAI took too long to respond" : "Couldn't reach OpenAI");
+    } finally {
+      clearTimeout(timer);
+    }
+
     if (res.ok) {
+      romajiModel = model;
       const content = (await res.json()).choices?.[0]?.message?.content ?? "{}";
-      const lines = JSON.parse(content).lines;
-      if (!Array.isArray(lines)) throw new Error("OpenAI returned no romaji");
-      return texts.map((_, i) => (typeof lines[i] === "string" ? tidy(lines[i]) : null));
+      let parsed;
+      try { parsed = JSON.parse(content); } catch { return {}; } // garbled reply: treat as all missing
+      // Accept { romaji: {...} }, { lines: {...} }, an array, or the map at the top level.
+      let map = parsed.romaji ?? parsed.lines ?? parsed;
+      if (Array.isArray(map)) map = Object.fromEntries(map.map((v, i) => [String(i + 1), v]));
+      return map && typeof map === "object" ? map : {};
     }
     if (res.status === 401) throw new Error("OpenAI rejected the API key.");
     if (res.status === 429) throw new Error("OpenAI quota or rate limit reached.");
@@ -157,22 +178,38 @@ async function openAIRomaji(texts) {
 }
 
 /**
- * Japanese → romaji for many texts: OpenAI if there's a key, else the dictionary worker.
- * With allowDictionary: false, OpenAI errors are thrown instead of falling back.
+ * Romaji for many texts via OpenAI. Lines are numbered so answers can't slip out of order,
+ * long songs are split into batches, and any lines the model skips are asked for once more.
+ * Returns an array aligned with `texts` (null where it still failed).
  */
-async function japaneseToRomajiMany(texts, { allowDictionary = true } = {}) {
-  if (!texts.length) return [];
-  const unique = [...new Set(texts)]; // choruses repeat; convert each line once
-  let converted;
-  if (openAIKey()) {
-    try {
-      converted = await openAIRomaji(unique);
-    } catch (e) {
-      if (!allowDictionary) throw e;
-      console.warn("OpenAI romaji failed, trying the dictionary instead:", e);
+async function openAIRomaji(texts) {
+  const out = new Array(texts.length).fill(null);
+  for (let start = 0; start < texts.length; start += ROMAJI_BATCH) {
+    let todo = texts.slice(start, start + ROMAJI_BATCH).map((text, i) => ({ text, at: start + i }));
+    for (let attempt = 0; attempt < 2 && todo.length; attempt++) {
+      const numbered = Object.fromEntries(todo.map((t, i) => [String(i + 1), t.text]));
+      const answer = await openAIRomajiRequest(numbered);
+      const missed = [];
+      todo.forEach((t, i) => {
+        const value = answer[String(i + 1)];
+        if (typeof value === "string" && value.trim() && !KANA.test(value) && !HAN.test(value)) out[t.at] = tidy(value);
+        else missed.push(t);
+      });
+      todo = missed;
     }
   }
-  converted ??= await japaneseBatchToRomaji(unique);
+  return out;
+}
+
+/**
+ * Japanese → romaji for many texts.
+ *  - With an OpenAI key: OpenAI only. (The dictionary fallback can hang inside the Even app.)
+ *  - Without a key: the dictionary worker.
+ */
+async function japaneseToRomajiMany(texts) {
+  if (!texts.length) return [];
+  const unique = [...new Set(texts)]; // choruses repeat; convert each line once
+  const converted = openAIKey() ? await openAIRomaji(unique) : await japaneseBatchToRomaji(unique);
   const byText = new Map(unique.map((t, i) => [t, converted[i]]));
   return texts.map((t) => byText.get(t) ?? null);
 }
@@ -312,15 +349,24 @@ export async function romajiCacheStats() {
 }
 
 /** Romanize a song's texts (title, artist, lyric lines); Latin-only texts come back as null. */
-async function japaneseSongToRomaji(songKey, texts, options) {
+async function japaneseSongToRomaji(songKey, texts) {
   const cached = await readRomajiCache(songKey, texts);
   if (cached) return cached;
   const needed = texts.filter((t) => t && NON_LATIN.test(t));
-  const converted = await japaneseToRomajiMany(needed, options);
+  const converted = await japaneseToRomajiMany(needed);
   let j = 0;
   const out = texts.map((t) => (t && NON_LATIN.test(t) ? converted[j++] : null));
-  await writeRomajiCache(songKey, texts, out);
+  // Only save complete results, so a partly failed conversion is retried next time.
+  const complete = texts.every((t, i) => !(t && NON_LATIN.test(t)) || out[i]);
+  if (complete) await writeRomajiCache(songKey, texts, out);
   return out;
+}
+
+/** Forget a song's saved romaji (used by "Search again"). */
+async function deleteRomaji(songKey) {
+  const db = await openDb();
+  if (!db) { memoryFallback.delete(songKey); return; }
+  await asPromise(db.transaction(DB_STORE, "readwrite").objectStore(DB_STORE).delete(songKey));
 }
 
 async function chineseToPinyin(text) {
@@ -442,13 +488,19 @@ function tidyTitle(title) {
     .trim();
 }
 
-/** Best LRCLIB search result whose length is within 4 s of the Spotify track (synced preferred). */
+/**
+ * LRCLIB search limited to results within 4 s of the Spotify track's length.
+ * Returns { synced, plain }: the best synced result and the best unsynced fallback (either may be null).
+ */
 async function searchClose(trackName, artistName, seconds) {
-  if (!trackName) return null;
+  if (!trackName) return { synced: null, plain: null };
   const params = artistName ? { track_name: trackName, artist_name: artistName } : { track_name: trackName };
   const results = (await lrclib("/search", params)) ?? [];
   const close = (r) => Math.abs((r.duration ?? 0) - seconds) <= 4;
-  return results.find((r) => r.syncedLyrics && close(r)) ?? results.find((r) => hasLyrics(r) && close(r)) ?? null;
+  return {
+    synced: results.find((r) => r.syncedLyrics && close(r)) ?? null,
+    plain: results.find((r) => hasLyrics(r) && close(r)) ?? null,
+  };
 }
 
 /**
@@ -501,8 +553,17 @@ async function findLyrics(item) {
   const track = item.name;
   const artist = item.artists?.[0]?.name ?? "";
   const seconds = Math.round((item.duration_ms ?? 0) / 1000);
+  // Synced lyrics are what we want. Unsynced ones are only kept as a fallback, and a saved
+  // unsynced match is re-checked after a week in case a synced version has been added.
+  let fallback = null; // best unsynced result seen so far
+  const keepFallback = (r) => { if (!fallback && hasLyrics(r)) fallback = r; };
   const found = async (result, how) => {
-    if (result?.id != null) await putLink({ key, lrclibId: result.id, at: Date.now() }).catch(() => {});
+    const synced = Boolean(result.syncedLyrics || result.instrumental);
+    if (result?.id != null) {
+      const link = { key, lrclibId: result.id, synced, at: Date.now() };
+      if (!synced) link.recheckAfter = Date.now() + NOT_FOUND_RETRY_MS;
+      await putLink(link).catch(() => {});
+    }
     lastLookup = { key, how };
     return result;
   };
@@ -511,8 +572,13 @@ async function findLyrics(item) {
   const link = await getLink(key).catch(() => null);
   if (link?.lrclibId != null) {
     const saved = await lrclib(`/get/${link.lrclibId}`, {});
-    if (hasLyrics(saved)) { lastLookup = { key, how: "saved" }; return saved; }
-    await deleteLink(key).catch(() => {}); // entry removed from LRCLIB: search again below
+    const savedIsSynced = Boolean(saved?.syncedLyrics || saved?.instrumental);
+    if (savedIsSynced) { lastLookup = { key, how: "saved" }; return saved; }
+    if (hasLyrics(saved) && (link.recheckAfter ?? 0) > Date.now()) {
+      lastLookup = { key, how: "saved (unsynced)" };
+      return saved; // unsynced, but checked for a synced version less than a week ago
+    }
+    keepFallback(saved); // unsynced and due for a re-check: look for a synced version below
   } else if (link?.notFoundUntil > Date.now()) {
     lastLookup = { key, how: "none" };
     return null; // searched recently and nothing existed; try again after a week
@@ -523,38 +589,44 @@ async function findLyrics(item) {
     track_name: track, artist_name: artist, album_name: item.album?.name ?? "", duration: seconds,
   });
   if (exact?.syncedLyrics || exact?.instrumental) return found(exact, "exact");
+  keepFallback(exact);
 
-  // 2) The exact match may only have unsynced lyrics, so search for a synced
-  //    version with a similar length, then any synced version.
+  // 2) Search by title + artist: a synced version of similar length, then any synced version.
   const results = (await lrclib("/search", { track_name: track, artist_name: artist })) ?? [];
   const close = (r) => Math.abs((r.duration ?? 0) - seconds) <= 4;
-  const searched = results.find((r) => r.syncedLyrics && close(r))
-    ?? results.find((r) => r.syncedLyrics)
-    ?? (exact?.plainLyrics ? exact : null)
-    ?? results.find((r) => r.plainLyrics);
-  if (searched) return found(searched, "search");
+  const synced = results.find((r) => r.syncedLyrics && close(r)) ?? results.find((r) => r.syncedLyrics);
+  if (synced) return found(synced, "search");
+  keepFallback(results.find((r) => r.plainLyrics && close(r)) ?? results.find((r) => r.plainLyrics));
 
   // 3) Free retry with a tidied-up title ("- 2011 Remaster", "(feat. …)" removed).
   const tidy = tidyTitle(track);
   if (tidy && tidy !== track) {
-    const r = (await searchClose(tidy, artist, seconds)) ?? (await searchClose(tidy, "", seconds));
-    if (r) return found(r, "tidied title");
+    for (const who of [artist, ""]) {
+      const r = await searchClose(tidy, who, seconds);
+      if (r.synced) return found(r.synced, "tidied title");
+      keepFallback(r.plain);
+    }
   }
 
   // 4) Ask ChatGPT for other names the song may be listed under (needs an OpenAI key).
+  //    Also runs when only unsynced lyrics were found, to look for a synced version.
   if (openAIKey()) {
     let candidates = [];
     try {
       candidates = await suggestSearchNames(item);
     } catch (e) {
-      if (/OpenAI rejected|quota or rate limit/.test(e.message)) throw e;
+      if (/OpenAI rejected|quota or rate limit/.test(e.message) && !fallback) throw e;
       console.warn("ChatGPT name suggestions failed:", e);
     }
     for (const c of candidates) {
       const r = await searchClose(c.track.trim(), (c.artist || "").trim(), seconds);
-      if (r) return found(r, "ChatGPT-assisted search");
+      if (r.synced) return found(r.synced, "ChatGPT-assisted search");
+      keepFallback(r.plain);
     }
   }
+
+  // 5) No synced version anywhere: use unsynced lyrics if we found any (re-checked in a week).
+  if (fallback) return found(fallback, "unsynced");
 
   // Nothing anywhere: remember that, so we don't spend tokens on it again for a week.
   await putLink({ key, lrclibId: null, notFoundUntil: Date.now() + NOT_FOUND_RETRY_MS, at: Date.now() }).catch(() => {});
@@ -562,9 +634,14 @@ async function findLyrics(item) {
   return null;
 }
 
-/** Forget the saved lyrics link for a song (e.g. wrong lyrics), so the next play searches again. */
+/**
+ * Forget everything saved for a song — the lyrics match and its romaji — so the next
+ * lookup searches from scratch (used by "Search again").
+ */
 export async function forgetLyricsLink(item) {
-  if (item) await deleteLink(songKey(item)).catch(() => {});
+  if (!item) return;
+  await deleteLink(songKey(item)).catch(() => {});
+  await deleteRomaji(songKey(item)).catch(() => {});
 }
 
 // --- Genius link (shown when no lyrics are found) ---
@@ -630,7 +707,7 @@ export async function romanizeTracksNow(tracks, { onProgress = () => {}, isCance
         } else if (await readRomajiCache(songKey(item), song.texts)) {
           stats.alreadySaved++;
         } else if (!isCancelled()) {
-          await japaneseSongToRomaji(songKey(item), song.texts, { allowDictionary: false });
+          await japaneseSongToRomaji(songKey(item), song.texts);
           stats.converted++;
         }
       } catch (e) {
@@ -702,12 +779,23 @@ export function mountRomajiTools(container, getPlaybackState) {
  * found, and "Search again" to forget a wrong/missing match. Cheap to call often.
  */
 export function renderLyricsHelp(container, tracker, item) {
-  const { status, geniusUrl } = tracker.state;
-  const key = `${tracker.key}|${status}|${geniusUrl || ""}`;
+  const { status, geniusUrl, lyrics: data } = tracker.state;
+  const key = `${tracker.key}|${status}|${geniusUrl || ""}|${data?.synced}|${data?.romanizing}|${data?.romanFailed}`;
   if (container.dataset.key === key) return;
   container.dataset.key = key;
   container.replaceChildren();
   if (!item || status === "idle" || status === "loading") return;
+
+  const note = (text) => {
+    const p = document.createElement("p");
+    p.className = "hint";
+    p.textContent = text;
+    container.append(p);
+  };
+  if (data?.romanFailed) note("Some lines couldn't be converted to Latin letters. Search again to retry.");
+  if (status === "ready" && !data?.synced && !data?.instrumental) {
+    note("Only unsynced lyrics were found. Search again to look for a synced version.");
+  }
 
   if (status === "none" && geniusUrl) {
     const a = document.createElement("a");
@@ -736,23 +824,28 @@ export class LyricsTracker {
   constructor(onChange) {
     this.onChange = onChange;
     this.key = null;
+    this.loadId = 0; // every lookup gets a new number; results from older lookups are ignored
     this.state = { status: "idle" };
     this.titleRoman = null;
     this.artistRoman = null;
   }
 
   update(item) {
+    if (this.forgetting) return; // "Search again" is clearing saved data; it starts the lookup itself
     const key = item ? songKey(item) : null;
     if (key === this.key) return;
     this.key = key;
     this.titleRoman = this.artistRoman = null;
     this.state = { status: key && item.type !== "episode" ? "loading" : "idle" };
+    const id = ++this.loadId;
     this.onChange();
-    if (this.state.status === "loading") this.load(item, key);
+    if (this.state.status === "loading") this.load(item, key, id);
   }
 
-  async load(item, key) {
-    const stillCurrent = () => this.key === key;
+  async load(item, key, id) {
+    // Only the newest lookup may change what's shown (pressing "Search again" repeatedly
+    // used to let an older, slower lookup overwrite a newer one).
+    const stillCurrent = () => this.loadId === id && this.key === key;
     let found;
     try {
       found = await findLyrics(item);
@@ -793,6 +886,8 @@ export class LyricsTracker {
         this.titleRoman = out[0];
         this.artistRoman = out[1];
         todo.forEach((line, i) => { line.roman = out[i + 2]; });
+        // Some lines still not converted (they show in Japanese; next play retries them).
+        if (lyrics && todo.some((line) => !line.roman)) lyrics.romanFailed = true;
       } else {
         const [title, artist] = await Promise.all([romanize(item.name, language), romanize(artistText, language)]);
         if (!stillCurrent()) return;
@@ -819,8 +914,18 @@ export class LyricsTracker {
   /** Wrong lyrics? Forget this song's saved match and search again from scratch. */
   async searchAgain(item) {
     if (!item) return;
-    await forgetLyricsLink(item);
-    this.key = null; // force update() to treat it as a new song
+    if (this.forgetting) return; // already searching again
+    this.forgetting = true;
+    this.loadId++;   // cancel any lookup still running
+    this.key = null; // and treat the song as new
+    this.titleRoman = this.artistRoman = null;
+    this.state = { status: "loading" };
+    this.onChange();
+    try {
+      await forgetLyricsLink(item);
+    } finally {
+      this.forgetting = false;
+    }
     this.update(item);
   }
 
