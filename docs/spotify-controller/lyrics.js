@@ -1,6 +1,7 @@
 // Lyrics for the current song, from LRCLIB (https://lrclib.net, free, no key needed),
 // with automatic romanization of non-Latin lyrics:
-//   Japanese → romaji (kuroshiro + kuromoji dictionary, loaded only when needed)
+//   Japanese → romaji (OpenAI if your key is set in Voice search settings — fast and
+//              context-aware, saved per song; otherwise the kuroshiro dictionary in a worker)
 //   Chinese  → pinyin (pinyin-pro)
 //   Korean   → Revised Romanization (built-in rules)
 //   Russian / Ukrainian (Cyrillic) → Latin letters (built-in table)
@@ -48,7 +49,7 @@ function loadScript(src) {
 
 // Japanese is converted in a background worker (romaji-worker.js): loading the
 // ~12 MB dictionary on the main thread froze the page, especially on phones.
-const ROMAJI_TIMEOUT_MS = 90000; // first use downloads the dictionary; give up after this
+const ROMAJI_TIMEOUT_MS = 60000; // first use downloads the dictionary; give up after this
 let romajiWorker = null;
 let romajiJobId = 0;
 const romajiJobs = new Map();
@@ -104,7 +105,104 @@ const tidy = (s) => s
   .trim();
 
 async function japaneseToRomaji(text) {
-  return (await japaneseBatchToRomaji([text]))[0];
+  return (await japaneseToRomajiMany([text]))[0];
+}
+
+// --- Japanese via OpenAI (preferred when a key is set) ---
+// Much lighter than the 12 MB dictionary (which can fail inside the Even app),
+// and it picks kanji readings from context, so the romaji is more accurate.
+const OPENAI_CHAT = "https://api.openai.com/v1/chat/completions";
+const ROMAJI_MODELS = ["gpt-4.1-mini", "gpt-4o-mini", "gpt-5-mini"]; // first available wins
+const ROMAJI_INSTRUCTIONS =
+  "You convert Japanese song lyrics to Hepburn romaji. You receive JSON {\"lines\": [...]}. " +
+  "Reply with JSON {\"lines\": [...]} containing exactly one romanized string per input line, in the same order. " +
+  "Use the correct readings for the song's context. Lowercase, words separated by spaces. " +
+  "Write long vowels with doubled letters (ou, uu, ei, aa) and never use macrons. " +
+  "Keep English words and punctuation as they are. Never translate.";
+
+const openAIKey = () => localStorage.getItem("openai_key") || ""; // set in Voice search settings
+
+async function openAIRomaji(texts) {
+  let lastError;
+  for (const model of ROMAJI_MODELS) {
+    const res = await fetch(OPENAI_CHAT, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${openAIKey()}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        response_format: { type: "json_object" },
+        messages: [
+          { role: "system", content: ROMAJI_INSTRUCTIONS },
+          { role: "user", content: JSON.stringify({ lines: texts }) },
+        ],
+      }),
+    });
+    if (res.ok) {
+      const content = (await res.json()).choices?.[0]?.message?.content ?? "{}";
+      const lines = JSON.parse(content).lines;
+      if (!Array.isArray(lines)) throw new Error("OpenAI returned no romaji");
+      return texts.map((_, i) => (typeof lines[i] === "string" ? tidy(lines[i]) : null));
+    }
+    let msg = `OpenAI error (${res.status})`;
+    try { msg = (await res.json()).error?.message || msg; } catch {}
+    lastError = new Error(msg);
+    if (res.status === 401 || res.status === 429 || !/model/i.test(msg)) break; // only retry on "unknown model"
+  }
+  throw lastError;
+}
+
+/** Japanese → romaji for many texts: OpenAI if there's a key, else the dictionary worker. */
+async function japaneseToRomajiMany(texts) {
+  if (!texts.length) return [];
+  const unique = [...new Set(texts)]; // choruses repeat; convert each line once
+  let converted;
+  if (openAIKey()) {
+    try {
+      converted = await openAIRomaji(unique);
+    } catch (e) {
+      console.warn("OpenAI romaji failed, trying the dictionary instead:", e);
+    }
+  }
+  converted ??= await japaneseBatchToRomaji(unique);
+  const byText = new Map(unique.map((t, i) => [t, converted[i]]));
+  return texts.map((t) => byText.get(t) ?? null);
+}
+
+// --- Saved romaji, so replaying a song is instant ---
+const ROMAJI_CACHE = "romaji_cache";
+const ROMAJI_CACHE_MAX = 40; // songs
+
+function readRomajiCache(songKey, texts) {
+  try {
+    const entry = JSON.parse(localStorage.getItem(ROMAJI_CACHE) || "{}")[songKey];
+    return entry && entry.texts.join("\n") === texts.join("\n") ? entry.out : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeRomajiCache(songKey, texts, out) {
+  try {
+    const cache = JSON.parse(localStorage.getItem(ROMAJI_CACHE) || "{}");
+    cache[songKey] = { at: Date.now(), texts, out };
+    const keys = Object.keys(cache).sort((a, b) => cache[b].at - cache[a].at);
+    keys.slice(ROMAJI_CACHE_MAX).forEach((k) => delete cache[k]);
+    localStorage.setItem(ROMAJI_CACHE, JSON.stringify(cache));
+  } catch {
+    // storage full or unavailable: just skip caching
+  }
+}
+
+/** Romanize a song's texts (title, artist, lyric lines); Latin-only texts come back as null. */
+async function japaneseSongToRomaji(songKey, texts) {
+  const cached = readRomajiCache(songKey, texts);
+  if (cached) return cached;
+  const needed = texts.filter((t) => t && NON_LATIN.test(t));
+  const converted = await japaneseToRomajiMany(needed);
+  let j = 0;
+  const out = texts.map((t) => (t && NON_LATIN.test(t) ? converted[j++] : null));
+  writeRomajiCache(songKey, texts, out);
+  return out;
 }
 
 async function chineseToPinyin(text) {
@@ -273,32 +371,30 @@ export class LyricsTracker {
 
     // Romanize title/artist and lyrics in the background.
     try {
-      const [title, artist] = await Promise.all([
-        romanize(item.name, language),
-        romanize(item.artists?.map((a) => a.name).join(", ") ?? "", language),
-      ]);
-      if (!stillCurrent()) return;
-      this.titleRoman = title;
-      this.artistRoman = artist;
-      this.onChange();
-
+      const artistText = item.artists?.map((a) => a.name).join(", ") ?? "";
       const lyrics = this.state.lyrics;
-      if (lyrics?.romanizing) {
-        const todo = lyrics.lines.filter((l) => NON_LATIN.test(l.text));
-        if (language === "ja" || todo.some((l) => KANA.test(l.text))) {
-          // One background batch for the whole song.
-          const romaji = await japaneseBatchToRomaji(todo.map((l) => l.text));
-          if (!stillCurrent()) return;
-          todo.forEach((line, i) => { line.roman = romaji[i]; });
-        } else {
-          for (const line of todo) {
-            line.roman = await romanize(line.text, language);
-            if (!stillCurrent()) return;
-          }
-        }
-        lyrics.romanizing = false;
+      const todo = lyrics?.romanizing ? lyrics.lines.filter((l) => NON_LATIN.test(l.text)) : [];
+
+      if (language === "ja" || KANA.test(item.name) || todo.some((l) => KANA.test(l.text))) {
+        // Japanese: title, artist and every lyric line in one request (cached per song).
+        const out = await japaneseSongToRomaji(key, [item.name, artistText, ...todo.map((l) => l.text)]);
+        if (!stillCurrent()) return;
+        this.titleRoman = out[0];
+        this.artistRoman = out[1];
+        todo.forEach((line, i) => { line.roman = out[i + 2]; });
+      } else {
+        const [title, artist] = await Promise.all([romanize(item.name, language), romanize(artistText, language)]);
+        if (!stillCurrent()) return;
+        this.titleRoman = title;
+        this.artistRoman = artist;
         this.onChange();
+        for (const line of todo) {
+          line.roman = await romanize(line.text, language);
+          if (!stillCurrent()) return;
+        }
       }
+      if (lyrics) lyrics.romanizing = false;
+      this.onChange();
     } catch (e) {
       console.warn("Romanization failed:", e);
       if (stillCurrent() && this.state.lyrics) {
