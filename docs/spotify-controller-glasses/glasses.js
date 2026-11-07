@@ -71,7 +71,13 @@ const POLL_MS = 3000;
 const RENDER_MS = 1000;
 const BRIDGE_TIMEOUT_MS = 4000;
 const LYRICS_TICK_MS = 250;  // how often to check whether the lyric line changed
-const LYRIC_WIDTH = 40;      // characters per lyric line (full 576px width)
+// Lyrics box. Carousel style: from below the song info down to just above the carousel,
+// which fits 4 lines (27 px each + padding). List style: 2 lines above the list.
+const LYRICS_PADDING = 4;
+const LYRICS_INNER_PX = 576 - 2 * LYRICS_PADDING;
+const LINE_PX = 27;
+const lyricsLines = () => (carousel() ? 4 : 2);
+const lyricsBoxHeight = () => lyricsLines() * LINE_PX + 2 * LYRICS_PADDING;
 
 const INFO = { id: 1, name: "info" };
 const LIST = { id: 2, name: "menu" };
@@ -216,25 +222,45 @@ function onHoldMenuPick(itemID) {
 const shownTitle = () => lyrics.titleRoman || playback.title;
 const shownArtist = () => lyrics.artistRoman || playback.artist;
 
-/** Split text into lines of at most `width` characters, breaking at spaces. */
-function wrap(text, width) {
+/**
+ * Split text into lines that fit `maxPx` pixels on the glasses (using Even's font
+ * measurements), breaking at spaces. Text with no spaces (e.g. Japanese) is broken
+ * character by character.
+ */
+function wrapPx(text, maxPx) {
   const lines = [];
   let line = "";
-  for (let word of text.split(/\s+/).filter(Boolean)) {
-    while (word.length > width) { // very long "words" (e.g. unspaced text)
-      if (line) { lines.push(line); line = ""; }
-      lines.push(word.slice(0, width));
-      word = word.slice(width);
+  const fits = (s) => getTextWidth(s) <= maxPx;
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const candidate = line ? `${line} ${word}` : word;
+    if (fits(candidate)) { line = candidate; continue; }
+    if (line) lines.push(line);
+    line = "";
+    // A single word wider than the line: split it by characters.
+    let piece = "";
+    for (const ch of word) {
+      if (fits(piece + ch)) piece += ch;
+      else { lines.push(piece); piece = ch; }
     }
-    if (!line) line = word;
-    else if (line.length + 1 + word.length <= width) line += " " + word;
-    else { lines.push(line); line = word; }
+    line = piece;
   }
   if (line) lines.push(line);
   return lines.length ? lines : [""];
 }
 
-/** The two lyric lines: "> current line" and "  next line" (a long current line uses both). */
+/** Take at most `max` lines; if there were more, shorten the last one with "...". */
+function limitLines(lines, max, maxPx) {
+  if (lines.length <= max) return lines;
+  const kept = lines.slice(0, max);
+  kept[max - 1] = pxTruncate(`${kept[max - 1]} ${lines.slice(max).join(" ")}`, maxPx);
+  return kept;
+}
+
+/**
+ * Lyric lines: "> current line" then "  next line".
+ * Carousel style has room for 4 lines: the current line may use up to 2 and the next line
+ * always gets at least 1, so it can never be pushed out. List style has room for 2.
+ */
 function lyricsText() {
   if (!isLoggedIn() || !playback.state?.item) return " ";
   const { status, lyrics: data } = lyrics.state;
@@ -251,12 +277,17 @@ function lyricsText() {
   const current = (i >= 0 && show(data.lines[i])) || "...";
   const next = show(data.lines[i + 1]);
 
-  const width = LYRIC_WIDTH - 2;
-  const currentLines = wrap(current, width);
-  if (currentLines.length >= 2) {
-    return `> ${currentLines[0]}\n  ${clip(currentLines.slice(1).join(" "), width)}`;
-  }
-  return `> ${currentLines[0]}\n  ${clip(next, width)}`;
+  const totalLines = lyricsLines();
+  const indent = "  ";
+  const width = LYRICS_INNER_PX - Math.max(getTextWidth("> "), getTextWidth(indent)) - 2;
+
+  // Current line: up to 2 lines, but always leave at least one line for the next lyric.
+  const currentLines = limitLines(wrapPx(current, width), Math.min(2, totalLines - 1), width);
+  const nextLines = next ? limitLines(wrapPx(next, width), totalLines - currentLines.length, width) : [];
+  return [
+    ...currentLines.map((l, n) => (n === 0 ? "> " : indent) + l),
+    ...nextLines.map((l) => indent + l),
+  ].join("\n");
 }
 
 /**
@@ -379,8 +410,10 @@ function pageLayout() {
   })];
   if (showLyrics) {
     textObject.push(new TextContainerProperty({
-      xPosition: 0, yPosition: carousel() ? 128 : 122, width: 576, height: 62,
-      borderWidth: 0, borderColor: 5, paddingLength: 4,
+      // Carousel: 124 → 240, just above the carousel box (which starts at 244).
+      xPosition: 0, yPosition: carousel() ? 288 - MENU_H - 4 - lyricsBoxHeight() : 122,
+      width: 576, height: lyricsBoxHeight(),
+      borderWidth: 0, borderColor: 5, paddingLength: LYRICS_PADDING,
       containerID: LYRICS.id, containerName: LYRICS.name,
       content: lyricsText(),
       isEventCapture: 0,
