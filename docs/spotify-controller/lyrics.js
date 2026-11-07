@@ -199,7 +199,7 @@ const memoryFallback = new Map(); // only used if IndexedDB is unavailable (not 
 function openDb() {
   dbPromise ??= new Promise((resolve) => {
     if (!self.indexedDB) return resolve(null);
-    const timer = setTimeout(() => resolve(null), 4000);
+    const timer = setTimeout(() => resolve(null), 15000); // generous, for slow phones
     let request;
     try {
       request = indexedDB.open(DB_NAME, 1);
