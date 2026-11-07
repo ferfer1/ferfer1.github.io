@@ -184,7 +184,9 @@ async function japaneseToRomajiMany(texts, { allowDictionary = true } = {}) {
 // original lyrics (to notice if they change). Capped at 5,000 songs (~20 MB); when full,
 // the songs played least recently are dropped first.
 const DB_NAME = "spotify-controller";
+const DB_VERSION = 2;            // v2 added the "lyriclinks" table
 const DB_STORE = "romaji";
+const LINKS_STORE = "lyriclinks"; // Spotify track → LRCLIB entry (or "nothing found, retry after …")
 const ROMAJI_MAX_SONGS = 5000;
 
 const asPromise = (request) => new Promise((resolve, reject) => {
@@ -202,13 +204,19 @@ function openDb() {
     const timer = setTimeout(() => resolve(null), 15000); // generous, for slow phones
     let request;
     try {
-      request = indexedDB.open(DB_NAME, 1);
+      request = indexedDB.open(DB_NAME, DB_VERSION);
     } catch {
       clearTimeout(timer);
       return resolve(null);
     }
     request.onupgradeneeded = () => {
-      request.result.createObjectStore(DB_STORE, { keyPath: "key" }).createIndex("at", "at");
+      const db = request.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) {
+        db.createObjectStore(DB_STORE, { keyPath: "key" }).createIndex("at", "at");
+      }
+      if (!db.objectStoreNames.contains(LINKS_STORE)) {
+        db.createObjectStore(LINKS_STORE, { keyPath: "key" });
+      }
     };
     request.onsuccess = async () => {
       clearTimeout(timer);
@@ -401,26 +409,181 @@ async function lrclib(path, params) {
   return res.json();
 }
 
+// --- Saved links: Spotify track → LRCLIB entry, so a song is only ever searched for once ---
+const NOT_FOUND_RETRY_MS = 7 * 24 * 60 * 60 * 1000; // LRCLIB grows; look again after a week
+
+async function getLink(key) {
+  const db = await openDb();
+  if (!db) return memoryFallback.get(`link:${key}`);
+  return asPromise(db.transaction(LINKS_STORE).objectStore(LINKS_STORE).get(key));
+}
+
+async function putLink(entry) {
+  const db = await openDb();
+  if (!db) { memoryFallback.set(`link:${entry.key}`, entry); return; }
+  await asPromise(db.transaction(LINKS_STORE, "readwrite").objectStore(LINKS_STORE).put(entry));
+}
+
+async function deleteLink(key) {
+  const db = await openDb();
+  if (!db) { memoryFallback.delete(`link:${key}`); return; }
+  await asPromise(db.transaction(LINKS_STORE, "readwrite").objectStore(LINKS_STORE).delete(key));
+}
+
+const hasLyrics = (r) => Boolean(r?.syncedLyrics || r?.plainLyrics || r?.instrumental);
+
+/** Remove "- 2011 Remaster", "(feat. …)", "[Live]", "Radio Edit" and similar from a title. */
+function tidyTitle(title) {
+  return title
+    .replace(/\s*[([](feat|ft|with)\.?\s[^)\]]*[)\]]/gi, "")
+    .replace(/\s+-\s+.*\b(remaster(ed)?|version|edit|live|mono|stereo|mix|demo|acoustic|bonus|deluxe)\b.*$/i, "")
+    .replace(/\s*[([][^)\]]*\b(remaster(ed)?|version|edit|live|mono|stereo|demo|bonus|deluxe)\b[^)\]]*[)\]]/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** Best LRCLIB search result whose length is within 4 s of the Spotify track (synced preferred). */
+async function searchClose(trackName, artistName, seconds) {
+  if (!trackName) return null;
+  const params = artistName ? { track_name: trackName, artist_name: artistName } : { track_name: trackName };
+  const results = (await lrclib("/search", params)) ?? [];
+  const close = (r) => Math.abs((r.duration ?? 0) - seconds) <= 4;
+  return results.find((r) => r.syncedLyrics && close(r)) ?? results.find((r) => hasLyrics(r) && close(r)) ?? null;
+}
+
+/**
+ * Ask ChatGPT for other names this song may be listed under on LRCLIB.
+ * It only suggests titles and artist names — never lyrics; the lyrics still come from LRCLIB.
+ */
+async function suggestSearchNames(item) {
+  const res = await fetch(OPENAI_CHAT, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${openAIKey()}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: ROMAJI_MODELS[0],
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You help find a song in a lyrics database by its name. Given a Spotify track, reply with JSON " +
+            "{\"candidates\": [{\"track\": \"...\", \"artist\": \"...\"}]} listing up to 4 other ways the same " +
+            "recording may be titled or credited: the original-language title, an official English or romanized " +
+            "title, the title without version/remaster/feature tags, the main or original artist name. " +
+            "Only give titles and artist names. Never include any lyrics.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            track: item.name,
+            artists: item.artists?.map((a) => a.name) ?? [],
+            album: item.album?.name ?? "",
+          }),
+        },
+      ],
+    }),
+  });
+  if (res.status === 401) throw new Error("OpenAI rejected the API key.");
+  if (res.status === 429) throw new Error("OpenAI quota or rate limit reached.");
+  if (!res.ok) return [];
+  const content = (await res.json()).choices?.[0]?.message?.content ?? "{}";
+  const list = JSON.parse(content).candidates;
+  return Array.isArray(list)
+    ? list.filter((c) => typeof c?.track === "string" && c.track.trim()).slice(0, 4)
+    : [];
+}
+
+/** Optional details about how the lyrics were found, for the status line. */
+let lastLookup = { key: null, how: "" };
+
 async function findLyrics(item) {
+  const key = songKey(item);
   const track = item.name;
   const artist = item.artists?.[0]?.name ?? "";
   const seconds = Math.round((item.duration_ms ?? 0) / 1000);
+  const found = async (result, how) => {
+    if (result?.id != null) await putLink({ key, lrclibId: result.id, at: Date.now() }).catch(() => {});
+    lastLookup = { key, how };
+    return result;
+  };
+
+  // 0) Saved from an earlier play: go straight to that LRCLIB entry (no searching, no tokens).
+  const link = await getLink(key).catch(() => null);
+  if (link?.lrclibId != null) {
+    const saved = await lrclib(`/get/${link.lrclibId}`, {});
+    if (hasLyrics(saved)) { lastLookup = { key, how: "saved" }; return saved; }
+    await deleteLink(key).catch(() => {}); // entry removed from LRCLIB: search again below
+  } else if (link?.notFoundUntil > Date.now()) {
+    lastLookup = { key, how: "none" };
+    return null; // searched recently and nothing existed; try again after a week
+  }
 
   // 1) Exact match on title, artist, album and length.
   const exact = await lrclib("/get", {
     track_name: track, artist_name: artist, album_name: item.album?.name ?? "", duration: seconds,
   });
-  if (exact?.syncedLyrics || exact?.instrumental) return exact;
+  if (exact?.syncedLyrics || exact?.instrumental) return found(exact, "exact");
 
   // 2) The exact match may only have unsynced lyrics, so search for a synced
   //    version with a similar length, then any synced version.
   const results = (await lrclib("/search", { track_name: track, artist_name: artist })) ?? [];
   const close = (r) => Math.abs((r.duration ?? 0) - seconds) <= 4;
-  return results.find((r) => r.syncedLyrics && close(r))
+  const searched = results.find((r) => r.syncedLyrics && close(r))
     ?? results.find((r) => r.syncedLyrics)
     ?? (exact?.plainLyrics ? exact : null)
-    ?? results.find((r) => r.plainLyrics)
-    ?? null;
+    ?? results.find((r) => r.plainLyrics);
+  if (searched) return found(searched, "search");
+
+  // 3) Free retry with a tidied-up title ("- 2011 Remaster", "(feat. …)" removed).
+  const tidy = tidyTitle(track);
+  if (tidy && tidy !== track) {
+    const r = (await searchClose(tidy, artist, seconds)) ?? (await searchClose(tidy, "", seconds));
+    if (r) return found(r, "tidied title");
+  }
+
+  // 4) Ask ChatGPT for other names the song may be listed under (needs an OpenAI key).
+  if (openAIKey()) {
+    let candidates = [];
+    try {
+      candidates = await suggestSearchNames(item);
+    } catch (e) {
+      if (/OpenAI rejected|quota or rate limit/.test(e.message)) throw e;
+      console.warn("ChatGPT name suggestions failed:", e);
+    }
+    for (const c of candidates) {
+      const r = await searchClose(c.track.trim(), (c.artist || "").trim(), seconds);
+      if (r) return found(r, "ChatGPT-assisted search");
+    }
+  }
+
+  // Nothing anywhere: remember that, so we don't spend tokens on it again for a week.
+  await putLink({ key, lrclibId: null, notFoundUntil: Date.now() + NOT_FOUND_RETRY_MS, at: Date.now() }).catch(() => {});
+  lastLookup = { key, how: "none" };
+  return null;
+}
+
+/** Forget the saved lyrics link for a song (e.g. wrong lyrics), so the next play searches again. */
+export async function forgetLyricsLink(item) {
+  if (item) await deleteLink(songKey(item)).catch(() => {});
+}
+
+// --- Genius link (shown when no lyrics are found) ---
+// Uses the Genius token from Voice search settings. It only links to the song's Genius page.
+export async function geniusSongUrl(item) {
+  const token = store.get("genius_token");
+  if (!token || !item?.name) return null;
+  try {
+    const q = `${tidyTitle(item.name)} ${item.artists?.[0]?.name ?? ""}`.trim();
+    const res = await fetch(`https://api.genius.com/search?${new URLSearchParams({ q, access_token: token })}`);
+    if (!res.ok) return null;
+    const hits = (await res.json())?.response?.hits ?? [];
+    const artist = (item.artists?.[0]?.name ?? "").toLowerCase();
+    const songs = hits.filter((h) => h.type === "song" && h.result?.url);
+    const best = songs.find((h) => (h.result.primary_artist?.name ?? "").toLowerCase().includes(artist)) ?? songs[0];
+    return best?.result.url ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // ---------- Shared song analysis ----------
@@ -534,6 +697,33 @@ export function mountRomajiTools(container, getPlaybackState) {
   showStorage();
 }
 
+/**
+ * Small helper row under the lyrics (phone screens): "View lyrics on Genius" when none were
+ * found, and "Search again" to forget a wrong/missing match. Cheap to call often.
+ */
+export function renderLyricsHelp(container, tracker, item) {
+  const { status, geniusUrl } = tracker.state;
+  const key = `${tracker.key}|${status}|${geniusUrl || ""}`;
+  if (container.dataset.key === key) return;
+  container.dataset.key = key;
+  container.replaceChildren();
+  if (!item || status === "idle" || status === "loading") return;
+
+  if (status === "none" && geniusUrl) {
+    const a = document.createElement("a");
+    a.href = geniusUrl;
+    a.target = "_blank";
+    a.rel = "noopener";
+    a.textContent = "View lyrics on Genius ↗";
+    container.append(a);
+  }
+  const again = document.createElement("button");
+  again.className = "link";
+  again.textContent = status === "ready" ? "Wrong lyrics? Search again" : "Search again";
+  again.onclick = () => { container.dataset.key = ""; tracker.searchAgain(item); };
+  container.append(again);
+}
+
 // ---------- Tracking lyrics for the current song ----------
 /**
  * Keeps lyrics (and romanized title/artist) in sync with the current track.
@@ -576,7 +766,11 @@ export class LyricsTracker {
     const { language, artistText, todo } = song;
 
     if (!found) {
-      this.state = { status: "none" };
+      this.state = { status: "none", geniusUrl: null };
+      // Offer a link to the song's Genius page instead (phone screen only).
+      geniusSongUrl(item).then((url) => {
+        if (stillCurrent() && this.state.status === "none" && url) { this.state.geniusUrl = url; this.onChange(); }
+      });
     } else {
       this.state = {
         status: "ready",
@@ -620,6 +814,14 @@ export class LyricsTracker {
         this.onChange();
       }
     }
+  }
+
+  /** Wrong lyrics? Forget this song's saved match and search again from scratch. */
+  async searchAgain(item) {
+    if (!item) return;
+    await forgetLyricsLink(item);
+    this.key = null; // force update() to treat it as a new song
+    this.update(item);
   }
 
   /** Index of the line being sung at `ms` (-1 before the first line). */

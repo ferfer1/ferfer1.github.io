@@ -6,7 +6,7 @@ import {
   getPlaylists, controls,
   editablePlaylists, currentEditablePlaylist, addTrackToPlaylist,
 } from "./spotify.js";
-import { LyricsTracker, lyricsEnabled, setLyricsEnabled, mountRomajiTools } from "./lyrics.js";
+import { LyricsTracker, lyricsEnabled, setLyricsEnabled, mountRomajiTools, renderLyricsHelp } from "./lyrics.js";
 import {
   MAX_LISTEN_MS, getOpenAIKey, mountVoiceSettings, startBrowserRecording,
   browserSpeechAvailable, startBrowserSpeech, transcribe, findSongs,
@@ -47,7 +47,9 @@ function renderLyrics(force = false) {
   $("lyrics-toggle").setAttribute("aria-checked", String(on));
   const box = $("lyrics");
   box.hidden = !on;
+  $("lyrics-help").hidden = !on;
   if (!on) return;
+  renderLyricsHelp($("lyrics-help"), lyrics, playback.state?.item);
 
   const { status, lyrics: data } = lyrics.state;
   const index = lyrics.lineIndexAt(playback.progress());
