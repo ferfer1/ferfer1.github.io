@@ -1,12 +1,12 @@
 // Spotify controller for Even Realities G2 glasses (Even Hub).
 //
 // Glasses layout (576x288):
-//   ┌──────────────────────────────┐
-//   │ Song title                   │  text container "info"
-//   │ Artist                       │
-//   │ 1:23 [=====-------] 3:45     │
-//   │ Playing                      │
-//   ├──────────────────────────────┤
+//   ┌───────┬──────────────────────┐
+//   │ album │ Song title           │  image container "art" (120x120, 16 greens)
+//   │  art  │ Artist               │  + text container "info"
+//   │       │ 1:23 [====---] 3:45  │
+//   │       │ Playing              │
+//   ├───────┴──────────────────────┤
 //   │ [Previous]                   │  list container "menu":
 //   │  Rewind 10s                  │  scroll moves the highlight (firmware),
 //   │  Play / Pause                │  tap presses the highlighted item.
@@ -25,8 +25,11 @@ import {
   TextContainerUpgrade,
   ListContainerProperty,
   ListItemContainerProperty,
+  ImageContainerProperty,
+  ImageRawDataUpdate,
   OsEventTypeList,
 } from "./vendor/even_hub_sdk.js";
+import { ART_SIZE, getArt, drawGreenPreview } from "./art.js";
 import {
   redirectUri, getClientId, setClientId, login, handleRedirect, isLoggedIn, logout,
   getPlayback, runAction, PlaybackState, fmtTime, getPlaylists, controls,
@@ -47,6 +50,8 @@ const BRIDGE_TIMEOUT_MS = 4000;
 
 const INFO = { id: 1, name: "info" };
 const LIST = { id: 2, name: "menu" };
+const ART = { id: 3, name: "art" };
+const TEXT_X = ART_SIZE + 8; // info text sits to the right of the album art
 
 const $ = (id) => document.getElementById(id);
 const playback = new PlaybackState();
@@ -62,7 +67,7 @@ let flashTimer;
 // ---------- Text helpers ----------
 const clip = (s, n) => (s.length > n ? s.slice(0, n - 3).trimEnd() + "..." : s);
 
-function progressBar(progress, duration, width = 16) {
+function progressBar(progress, duration, width = 10) {
   const filled = duration ? Math.round((progress / duration) * width) : 0;
   return `[${"=".repeat(filled)}${"-".repeat(width - filled)}]`;
 }
@@ -97,8 +102,9 @@ function currentItems() {
 }
 
 function infoText() {
+  // The text area is ~448px wide (beside the album art), so lines are kept short.
   if (!isLoggedIn()) {
-    return "Spotify Controller\nNot connected.\nOpen your phone to log in.\n" + flash;
+    return "Spotify Controller\nNot connected.\nOpen your phone\nto log in. " + flash;
   }
 
   if (screen === "playlists") {
@@ -106,24 +112,24 @@ function infoText() {
     const to = Math.min(playlistOffset + PLAYLISTS_PER_PAGE, playlists.length);
     return [
       `Playlists (${from}-${to} of ${playlists.length})`,
-      "Scroll to pick, tap to play",
-      "Double-tap to go back",
-      flash || (playback.title ? `Now: ${clip(playback.title, 30)}` : ""),
+      "Scroll, tap to play",
+      "Double-tap: back",
+      clip(flash || (playback.title ? `Now: ${playback.title}` : ""), 28),
     ].join("\n");
   }
 
   if (!playback.state?.item) {
-    return "Nothing playing\nStart Spotify on any device,\nor pick a Playlist below.\n" + flash;
+    return "Nothing playing\nStart Spotify, or\npick a Playlist below.\n" + clip(flash, 28);
   }
   const p = playback.progress();
   const d = playback.duration;
   const status = flash || (playback.isPlaying ? "Playing" : "Paused") +
-    (playback.device ? ` on ${clip(playback.device, 22)}` : "");
+    (playback.device ? ` on ${playback.device}` : "");
   return [
-    clip(playback.title, 32),
-    clip(playback.artist, 36),
+    clip(playback.title, 28),
+    clip(playback.artist, 30),
     `${fmtTime(p)} ${progressBar(p, d)} ${fmtTime(d)}`,
-    status,
+    clip(status, 28),
   ].join("\n");
 }
 
@@ -131,9 +137,13 @@ function infoText() {
 function pageLayout() {
   const items = currentItems();
   return {
-    containerTotalNum: 2,
+    containerTotalNum: 3,
+    imageObject: [new ImageContainerProperty({
+      xPosition: 0, yPosition: 0, width: ART_SIZE, height: ART_SIZE,
+      containerID: ART.id, containerName: ART.name,
+    })],
     textObject: [new TextContainerProperty({
-      xPosition: 0, yPosition: 0, width: 576, height: 120,
+      xPosition: TEXT_X, yPosition: 0, width: 576 - TEXT_X, height: 120,
       borderWidth: 0, borderColor: 5, paddingLength: 4,
       containerID: INFO.id, containerName: INFO.name,
       content: infoText(),
@@ -163,6 +173,7 @@ async function createPage() {
   }
   pageReady = result === 0;
   lastSent = infoText();
+  if (pageReady) pushArt({ resend: true }); // image containers start empty
   $("bridge-status").textContent = pageReady
     ? "Connected to glasses ✓"
     : `Glasses not detected (code ${result}), so showing a preview only. ` +
@@ -174,6 +185,49 @@ async function rebuildPage() {
   if (!bridge || !pageReady) return;
   lastSent = infoText();
   await bridge.rebuildPageContainer(new RebuildPageContainer(pageLayout()));
+  pushArt({ resend: true }); // a full redraw clears the image
+}
+
+// ---------- Album art ----------
+// Images go over Bluetooth slowly (~0.1-1s), so only send when the cover changes,
+// one at a time, and always finish on the latest cover.
+let artWanted = "";       // cover URL that should be showing ("" = blank)
+let artDraw = 0;          // bumps on every page (re)draw, which clears the image
+let artOnGlasses = null;  // "<draw>|<url>" last sent to the glasses
+let artSending = false;
+
+function currentArtUrl() {
+  return isLoggedIn() && playback.state?.item ? playback.artUrlAtLeast(ART_SIZE) : "";
+}
+
+async function syncArt() {
+  const url = currentArtUrl();
+  if (url === artWanted) return;
+  artWanted = url;
+  const { gray } = await getArt(url);
+  if (artWanted === url) drawGreenPreview($("preview-art"), gray);
+  pushArt();
+}
+
+async function pushArt({ resend = false } = {}) {
+  if (resend) artDraw++;
+  if (!bridge || !pageReady || artSending) return;
+  artSending = true;
+  try {
+    while (artOnGlasses !== `${artDraw}|${artWanted}`) {
+      const key = `${artDraw}|${artWanted}`;
+      const { png } = await getArt(artWanted);
+      const result = await bridge.updateImageRawData(new ImageRawDataUpdate({
+        containerID: ART.id, containerName: ART.name, imageData: png,
+      }));
+      if (result !== "success") console.warn("Album art not shown on glasses:", result);
+      artOnGlasses = key; // don't retry in a loop; the next song change or redraw tries again
+    }
+  } catch (e) {
+    console.warn("Album art error:", e);
+  } finally {
+    artSending = false;
+  }
 }
 
 // Send text updates one at a time (Bluetooth is slow) and only when something changed.
@@ -337,6 +391,7 @@ function renderPreview() {
 function render() {
   renderPreview();
   pushInfo();
+  syncArt();
 }
 
 function showSections() {

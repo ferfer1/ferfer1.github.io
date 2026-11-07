@@ -10,8 +10,25 @@
   text-align: left;
 }
 
+.lens-top {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-bottom: 8px;
+}
+
+#preview-art {
+  width: 84px;
+  height: 84px;
+  flex: none;
+  background: #000;
+  image-rendering: pixelated; /* show the real 120x120 pixels */
+}
+
 #preview-info {
-  margin: 0 0 8px;
+  flex: 1;
+  min-width: 0;
+  margin: 0;
   line-height: 1.35;
   white-space: pre;
   overflow: hidden;
