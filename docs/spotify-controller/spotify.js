@@ -213,6 +213,14 @@ export class PlaybackState {
     const item = this.state?.item;
     return item?.album?.images?.[0]?.url || item?.images?.[0]?.url || "";
   }
+  /** The smallest cover image that is at least `minSize` px wide (saves bandwidth for the glasses). */
+  artUrlAtLeast(minSize) {
+    const item = this.state?.item;
+    const images = item?.album?.images || item?.images || [];
+    const bigEnough = images.filter((i) => (i.width ?? minSize) >= minSize);
+    const pick = bigEnough.sort((a, b) => (a.width ?? 0) - (b.width ?? 0))[0] || images[0];
+    return pick?.url || "";
+  }
 }
 
 /** Runs a control action against the current state: "previous" | "rewind" | "toggle" | "next". */
