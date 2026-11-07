@@ -7,11 +7,13 @@
 //   │       │ 1:23 [====---] 3:45  │
 //   │       │ Playing              │
 //   ├───────┴──────────────────────┤
+//   │ > current lyric line         │  text container "lyrics" (2 lines, romanized;
+//   │   next lyric line            │  hidden when lyrics are turned off)
+//   ├──────────────────────────────┤
 //   │ [Previous]                   │  list container "menu":
 //   │  Rewind 10s                  │  scroll moves the highlight (firmware),
 //   │  Play / Pause                │  tap presses the highlighted item.
-//   │  Skip                        │
-//   │  Playlists                   │
+//   │  Skip / Playlists / Lyrics   │
 //   └──────────────────────────────┘
 //
 // Screens:
@@ -28,12 +30,19 @@ import {
   ImageContainerProperty,
   ImageRawDataUpdate,
   OsEventTypeList,
+  AudioInputSource,
 } from "./vendor/even_hub_sdk.js";
 import { ART_SIZE, getArt, drawGreenPreview } from "./art.js";
 import {
   redirectUri, getClientId, setClientId, login, handleRedirect, isLoggedIn, logout,
   getPlayback, runAction, PlaybackState, fmtTime, getPlaylists, controls,
+  editablePlaylists, currentEditablePlaylist, addTrackToPlaylist,
 } from "../spotify-controller/spotify.js";
+import { LyricsTracker, lyricsEnabled, setLyricsEnabled } from "../spotify-controller/lyrics.js";
+import {
+  MAX_LISTEN_MS, getOpenAIKey, mountVoiceSettings, startBrowserRecording,
+  pcmToWav, transcribe, findSongs,
+} from "../spotify-controller/voice.js";
 
 const CONTROLS = [
   { label: "Previous", action: "previous", done: "Previous track" },
@@ -41,20 +50,29 @@ const CONTROLS = [
   { label: "Play / Pause", action: "toggle" },
   { label: "Skip", action: "next", done: "Skipped" },
   { label: "Playlists", open: "playlists" },
+  { label: () => `Lyrics: ${lyricsEnabled() ? "On" : "Off"}`, key: "lyrics", toggleLyrics: true },
+  { label: "Find a song (mic)", key: "voice", voice: true },
 ];
+
+// Voice-search screens; double-tap on any of them cancels back to the controls.
+const VOICE_SCREENS = ["listening", "searching", "results", "pickPlaylist"];
 
 const PLAYLISTS_PER_PAGE = 18; // + "< Back" + "More..." = 20, the glasses' list limit
 const POLL_MS = 3000;
 const RENDER_MS = 1000;
 const BRIDGE_TIMEOUT_MS = 4000;
+const LYRICS_TICK_MS = 250;  // how often to check whether the lyric line changed
+const LYRIC_WIDTH = 40;      // characters per lyric line (full 576px width)
 
 const INFO = { id: 1, name: "info" };
 const LIST = { id: 2, name: "menu" };
 const ART = { id: 3, name: "art" };
+const LYRICS = { id: 4, name: "lyrics" };
 const TEXT_X = ART_SIZE + 8; // info text sits to the right of the album art
 
 const $ = (id) => document.getElementById(id);
 const playback = new PlaybackState();
+const lyrics = new LyricsTracker(() => render());
 
 let bridge = null;      // set when running inside the Even app
 let pageReady = false;  // true once the glasses page has been drawn
@@ -82,6 +100,25 @@ function setFlash(text, ms = 2000) {
 // ---------- What each screen shows ----------
 /** The list items for the current screen: [{ label, run }]. */
 function currentItems() {
+  if (screen === "listening") {
+    return [
+      { label: "Done, search now", run: () => finishListening() },
+      { label: "Cancel", run: () => cancelVoice() },
+    ];
+  }
+  if (screen === "searching") return [{ label: "Cancel", run: () => cancelVoice() }];
+  if (screen === "results") {
+    return [
+      { label: "< Cancel", run: () => cancelVoice() },
+      ...voice.songs.map((s) => ({ label: clip(`${s.name} - ${s.artist}`, 44), run: () => chooseSong(s) })),
+    ];
+  }
+  if (screen === "pickPlaylist") {
+    return [
+      { label: "< Cancel", run: () => cancelVoice() },
+      ...voice.playlists.slice(0, 19).map((p) => ({ label: clip(p.name, 40), run: () => addSong(p) })),
+    ];
+  }
   if (screen === "playlists") {
     const page = playlists.slice(playlistOffset, playlistOffset + PLAYLISTS_PER_PAGE);
     const items = [{ label: "< Back", run: () => setScreen("controls") }];
@@ -98,13 +135,83 @@ function currentItems() {
     }
     return items;
   }
-  return CONTROLS.map((c) => ({ label: c.label, run: () => pressControl(c) }));
+  return CONTROLS.map((c) => ({
+    label: typeof c.label === "function" ? c.label() : c.label,
+    key: c.key,
+    run: () => pressControl(c),
+  }));
+}
+
+// Song title/artist in Latin letters when available (the glasses' font may lack e.g. Japanese).
+const shownTitle = () => lyrics.titleRoman || playback.title;
+const shownArtist = () => lyrics.artistRoman || playback.artist;
+
+/** Split text into lines of at most `width` characters, breaking at spaces. */
+function wrap(text, width) {
+  const lines = [];
+  let line = "";
+  for (let word of text.split(/\s+/).filter(Boolean)) {
+    while (word.length > width) { // very long "words" (e.g. unspaced text)
+      if (line) { lines.push(line); line = ""; }
+      lines.push(word.slice(0, width));
+      word = word.slice(width);
+    }
+    if (!line) line = word;
+    else if (line.length + 1 + word.length <= width) line += " " + word;
+    else { lines.push(line); line = word; }
+  }
+  if (line) lines.push(line);
+  return lines.length ? lines : [""];
+}
+
+/** The two lyric lines: "> current line" and "  next line" (a long current line uses both). */
+function lyricsText() {
+  if (!isLoggedIn() || !playback.state?.item) return " ";
+  const { status, lyrics: data } = lyrics.state;
+  if (status === "loading") return "Loading lyrics...";
+  if (status === "none") return "No lyrics found for this song.";
+  if (status === "error") return "Couldn't load lyrics.";
+  if (status !== "ready") return " ";
+  if (data.instrumental && !data.lines.length) return "(Instrumental)";
+  if (!data.synced) return "Lyrics for this song aren't time-synced.";
+  if (data.romanizing) return "Converting lyrics to Latin letters...";
+
+  const show = (line) => (line ? (line.roman ?? line.text) : "");
+  const i = lyrics.lineIndexAt(playback.progress());
+  const current = (i >= 0 && show(data.lines[i])) || "...";
+  const next = show(data.lines[i + 1]);
+
+  const width = LYRIC_WIDTH - 2;
+  const currentLines = wrap(current, width);
+  if (currentLines.length >= 2) {
+    return `> ${currentLines[0]}\n  ${clip(currentLines.slice(1).join(" "), width)}`;
+  }
+  return `> ${currentLines[0]}\n  ${clip(next, width)}`;
 }
 
 function infoText() {
   // The text area is ~448px wide (beside the album art), so lines are kept short.
   if (!isLoggedIn()) {
     return "Spotify Controller\nNot connected.\nOpen your phone\nto log in. " + flash;
+  }
+
+  if (screen === "listening") {
+    const left = Math.max(0, Math.ceil((voice.listenUntil - Date.now()) / 1000));
+    return `Listening... ${left}s\nSing or say the song\nTap "Done" when finished\n${clip(flash, 28)}`;
+  }
+  if (screen === "searching") {
+    return `Searching...\n${clip(voice.heard ? `Heard: ${voice.heard}` : "Working out what you said", 28)}\n\n${clip(flash, 28)}`;
+  }
+  if (screen === "results") {
+    return [
+      clip(`Heard: ${voice.heard}`, 28),
+      "Tap the right song",
+      clip(`to add to ${voice.target ? voice.target.name : "a playlist"}`, 28),
+      clip(flash, 28),
+    ].join("\n");
+  }
+  if (screen === "pickPlaylist") {
+    return [clip(`Add: ${voice.song?.name ?? ""}`, 28), "Pick a playlist", "Double-tap: cancel", clip(flash, 28)].join("\n");
   }
 
   if (screen === "playlists") {
@@ -114,7 +221,7 @@ function infoText() {
       `Playlists (${from}-${to} of ${playlists.length})`,
       "Scroll, tap to play",
       "Double-tap: back",
-      clip(flash || (playback.title ? `Now: ${playback.title}` : ""), 28),
+      clip(flash || (playback.title ? `Now: ${shownTitle()}` : ""), 28),
     ].join("\n");
   }
 
@@ -126,8 +233,8 @@ function infoText() {
   const status = flash || (playback.isPlaying ? "Playing" : "Paused") +
     (playback.device ? ` on ${playback.device}` : "");
   return [
-    clip(playback.title, 28),
-    clip(playback.artist, 30),
+    clip(shownTitle(), 28),
+    clip(shownArtist(), 30),
     `${fmtTime(p)} ${progressBar(p, d)} ${fmtTime(d)}`,
     clip(status, 28),
   ].join("\n");
@@ -136,21 +243,35 @@ function infoText() {
 // ---------- Glasses page ----------
 function pageLayout() {
   const items = currentItems();
+  const showLyrics = lyricsEnabled();
+  const listY = showLyrics ? 186 : 124; // lyrics take 2 lines (62px) above the list
+
+  const textObject = [new TextContainerProperty({
+    xPosition: TEXT_X, yPosition: 0, width: 576 - TEXT_X, height: 120,
+    borderWidth: 0, borderColor: 5, paddingLength: 4,
+    containerID: INFO.id, containerName: INFO.name,
+    content: infoText(),
+    isEventCapture: 0,
+  })];
+  if (showLyrics) {
+    textObject.push(new TextContainerProperty({
+      xPosition: 0, yPosition: 122, width: 576, height: 62,
+      borderWidth: 0, borderColor: 5, paddingLength: 4,
+      containerID: LYRICS.id, containerName: LYRICS.name,
+      content: lyricsText(),
+      isEventCapture: 0,
+    }));
+  }
+
   return {
-    containerTotalNum: 3,
+    containerTotalNum: 2 + textObject.length,
     imageObject: [new ImageContainerProperty({
       xPosition: 0, yPosition: 0, width: ART_SIZE, height: ART_SIZE,
       containerID: ART.id, containerName: ART.name,
     })],
-    textObject: [new TextContainerProperty({
-      xPosition: TEXT_X, yPosition: 0, width: 576 - TEXT_X, height: 120,
-      borderWidth: 0, borderColor: 5, paddingLength: 4,
-      containerID: INFO.id, containerName: INFO.name,
-      content: infoText(),
-      isEventCapture: 0,
-    })],
+    textObject,
     listObject: [new ListContainerProperty({
-      xPosition: 0, yPosition: 124, width: 576, height: 164,
+      xPosition: 0, yPosition: listY, width: 576, height: 288 - listY,
       borderWidth: 0, borderColor: 5, paddingLength: 4,
       containerID: LIST.id, containerName: LIST.name,
       isEventCapture: 1, // the list receives scroll + tap
@@ -172,7 +293,7 @@ async function createPage() {
     result = e?.message ?? "unknown";
   }
   pageReady = result === 0;
-  lastSent = infoText();
+  markTextsSent();
   if (pageReady) pushArt({ resend: true }); // image containers start empty
   $("bridge-status").textContent = pageReady
     ? "Connected to glasses ✓"
@@ -183,7 +304,7 @@ async function createPage() {
 // Redraw the whole page (needed whenever the list items change).
 async function rebuildPage() {
   if (!bridge || !pageReady) return;
-  lastSent = infoText();
+  markTextsSent();
   await bridge.rebuildPageContainer(new RebuildPageContainer(pageLayout()));
   pushArt({ resend: true }); // a full redraw clears the image
 }
@@ -230,23 +351,31 @@ async function pushArt({ resend = false } = {}) {
   }
 }
 
-// Send text updates one at a time (Bluetooth is slow) and only when something changed.
-let lastSent = "";
-let sending = false;
-async function pushInfo() {
-  if (!bridge || !pageReady || sending) return;
-  const text = infoText();
-  if (text === lastSent) return;
-  sending = true;
+// Send text updates one at a time per box (Bluetooth is slow), only when something changed.
+const texts = {
+  info: { box: INFO, make: infoText, last: "", sending: false, shown: () => true },
+  lyrics: { box: LYRICS, make: lyricsText, last: "", sending: false, shown: lyricsEnabled },
+};
+
+// After a (re)draw, the boxes already contain the current text.
+function markTextsSent() {
+  for (const t of Object.values(texts)) t.last = t.make();
+}
+
+async function pushText(t) {
+  if (!bridge || !pageReady || t.sending || !t.shown()) return;
+  const text = t.make();
+  if (text === t.last) return;
+  t.sending = true;
   try {
     await bridge.textContainerUpgrade(new TextContainerUpgrade({
-      containerID: INFO.id, containerName: INFO.name, content: text,
+      containerID: t.box.id, containerName: t.box.name, content: text,
     }));
-    lastSent = text;
+    t.last = text;
   } finally {
-    sending = false;
+    t.sending = false;
   }
-  if (infoText() !== lastSent) pushInfo(); // something changed while sending
+  if (t.make() !== t.last) pushText(t); // something changed while sending
 }
 
 function setScreen(next) {
@@ -284,17 +413,25 @@ function isRepeat(key, ms = 500) {
 function goBackOrExit() {
   if (isRepeat("double-tap", 800)) return;
   if (screen === "controls") bridge?.shutDownPageContainer(1); // system "exit?" prompt
+  else if (VOICE_SCREENS.includes(screen)) cancelVoice();
   else setScreen("controls");
 }
 
 function activate(index) {
   const items = currentItems();
   const item = items[index];
-  if (!item || isRepeat(`${screen}:${item.label}`)) return;
+  if (!item || isRepeat(`${screen}:${item.key ?? item.label}`)) return;
   item.run();
 }
 
 function handleGlassesEvent(event) {
+  // Microphone audio from the glasses (only while listening).
+  if (event.audioEvent) {
+    const pcm = event.audioEvent.audioPcm;
+    if (voice.recordingGlasses && pcm?.length) voice.pcm.push(pcm instanceof Uint8Array ? pcm : Uint8Array.from(pcm));
+    return;
+  }
+
   const listType = eventTypeOf(event.listEvent);
   const textType = eventTypeOf(event.textEvent);
   const sysType = eventTypeOf(event.sysEvent);
@@ -322,7 +459,9 @@ function handleGlassesEvent(event) {
 
 // ---------- Actions ----------
 async function pressControl(control) {
+  if (control.toggleLyrics) return toggleLyrics();
   if (!isLoggedIn()) return setFlash("Log in on your phone first", 3000);
+  if (control.voice) return startVoice();
   if (control.open === "playlists") return openPlaylists();
 
   const pending = runAction(control.action, playback);
@@ -333,6 +472,132 @@ async function pressControl(control) {
     setFlash(e.message, 4000);
   }
   setTimeout(refresh, 500); // let Spotify catch up, then sync
+}
+
+// ---------- Voice search: listen → find song → add to playlist ----------
+const voice = {
+  run: 0,                 // bumps on cancel so stale results are ignored
+  recordingGlasses: false,
+  pcm: [],                // raw audio chunks from the glasses mic
+  browserRec: null,       // fallback recorder when previewing in a normal browser
+  listenUntil: 0,
+  timer: null,
+  heard: "",
+  songs: [],
+  target: null,           // playlist currently playing, if you can add to it
+  song: null,
+  playlists: [],
+};
+
+async function startVoice() {
+  if (!getOpenAIKey()) return setFlash("Add OpenAI key on phone", 4000);
+  voice.run++;
+  Object.assign(voice, { pcm: [], heard: "", songs: [], target: null, song: null, playlists: [] });
+
+  try {
+    if (bridge && pageReady) {
+      voice.recordingGlasses = true;
+      const ok = await bridge.audioControl(true, AudioInputSource.Glasses);
+      if (!ok) { voice.recordingGlasses = false; return setFlash("Couldn't turn on the mic", 4000); }
+    } else {
+      voice.browserRec = await startBrowserRecording(); // preview in a normal browser
+    }
+  } catch (e) {
+    voice.recordingGlasses = false;
+    return setFlash(e.message, 4000);
+  }
+
+  voice.listenUntil = Date.now() + MAX_LISTEN_MS;
+  clearTimeout(voice.timer);
+  voice.timer = setTimeout(finishListening, MAX_LISTEN_MS);
+  setScreen("listening");
+}
+
+/** Stop the microphone and return the recording as { blob, filename } (or null). */
+async function stopMic() {
+  clearTimeout(voice.timer);
+  if (voice.recordingGlasses) {
+    voice.recordingGlasses = false;
+    try { await bridge.audioControl(false); } catch {}
+    const bytes = voice.pcm.reduce((n, c) => n + c.length, 0);
+    return bytes > 16000 ? { blob: pcmToWav(voice.pcm), filename: "voice.wav" } : null; // < 0.5s = nothing heard
+  }
+  if (voice.browserRec) {
+    const rec = voice.browserRec;
+    voice.browserRec = null;
+    return rec.stop();
+  }
+  return null;
+}
+
+async function finishListening() {
+  if (screen !== "listening") return;
+  const run = voice.run;
+  setScreen("searching");
+  try {
+    const audio = await stopMic();
+    if (!audio) return backWithFlash("Didn't hear anything");
+    voice.heard = await transcribe(audio.blob, audio.filename);
+    if (run !== voice.run) return;
+    if (!voice.heard) return backWithFlash("Didn't catch that");
+    render();
+
+    const [songs, target] = await Promise.all([findSongs(voice.heard), currentEditablePlaylist(playback.state)]);
+    if (run !== voice.run) return;
+    if (!songs.length) return backWithFlash("No matching songs found");
+    voice.songs = songs;
+    voice.target = target;
+    setScreen("results");
+  } catch (e) {
+    if (run === voice.run) backWithFlash(e.message);
+  }
+}
+
+async function chooseSong(song) {
+  voice.song = song;
+  if (voice.target) return addSong(voice.target);
+  // Not playing from a playlist you can edit: pick one of yours.
+  const run = voice.run;
+  setFlash("Loading playlists...", 8000);
+  try {
+    voice.playlists = await editablePlaylists();
+  } catch (e) {
+    return backWithFlash(e.message);
+  }
+  if (run !== voice.run) return;
+  if (!voice.playlists.length) return backWithFlash("No playlists you can add to");
+  flash = "";
+  setScreen("pickPlaylist");
+}
+
+async function addSong(playlist) {
+  const song = voice.song;
+  setScreen("controls");
+  setFlash("Adding...", 8000);
+  try {
+    await addTrackToPlaylist(playlist.id, song.uri);
+    setFlash(`Added to ${playlist.name}`, 4000);
+  } catch (e) {
+    setFlash(e.message, 5000);
+  }
+}
+
+function backWithFlash(text) {
+  setScreen("controls");
+  setFlash(text, 4000);
+}
+
+async function cancelVoice() {
+  voice.run++;
+  await stopMic();
+  setScreen("controls");
+  setFlash("Cancelled");
+}
+
+function toggleLyrics() {
+  setLyricsEnabled(!lyricsEnabled());
+  rebuildPage(); // the layout changes (lyrics box shown/hidden) and so does the item label
+  setFlash(lyricsEnabled() ? "Lyrics on" : "Lyrics off");
 }
 
 async function openPlaylists() {
@@ -376,6 +641,7 @@ let previewIndex = 0;
 
 function renderPreview() {
   $("preview-info").textContent = infoText();
+  renderPreviewLyrics();
   const items = currentItems();
   previewIndex = Math.min(previewIndex, items.length - 1);
   const ul = $("preview-menu");
@@ -388,10 +654,25 @@ function renderPreview() {
   }));
 }
 
+function renderPreviewLyrics() {
+  $("preview-lyrics").hidden = !lyricsEnabled();
+  $("preview-lyrics").textContent = lyricsText();
+}
+
 function render() {
+  lyrics.update(isLoggedIn() ? playback.state?.item : null); // starts loading lyrics on song change
   renderPreview();
-  pushInfo();
+  pushText(texts.info);
+  pushText(texts.lyrics);
   syncArt();
+}
+
+// Lyrics change more often than once a second, so check them on their own faster timer.
+function tickLyrics() {
+  if (screen === "listening") { renderPreview(); pushText(texts.info); } // countdown
+  if (!lyricsEnabled() || !playback.isPlaying) return;
+  renderPreviewLyrics();
+  pushText(texts.lyrics);
 }
 
 function showSections() {
@@ -424,6 +705,7 @@ async function init() {
   };
   $("login-btn").onclick = login;
   $("logout").onclick = () => { logout(); location.reload(); };
+  mountVoiceSettings($("voice-settings"));
 
   // Keyboard stand-ins for the glasses: ↑/↓ scroll, Enter = tap, Esc = double-tap.
   document.addEventListener("keydown", (e) => {
@@ -456,6 +738,7 @@ async function init() {
   await refresh();
   timers.push(setInterval(refresh, POLL_MS));
   timers.push(setInterval(() => playback.isPlaying && render(), RENDER_MS));
+  timers.push(setInterval(tickLyrics, LYRICS_TICK_MS));
 }
 
 init();
