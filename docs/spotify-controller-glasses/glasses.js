@@ -39,7 +39,9 @@ import {
   getPlayback, runAction, PlaybackState, fmtTime, getPlaylists, controls,
   editablePlaylists, currentEditablePlaylist, addTrackToPlaylist,
 } from "../spotify-controller/spotify.js";
-import { LyricsTracker, lyricsEnabled, setLyricsEnabled, mountRomajiTools } from "../spotify-controller/lyrics.js";
+import {
+  LyricsTracker, lyricsEnabled, setLyricsEnabled, mountRomajiTools, renderLyricsHelp,
+} from "../spotify-controller/lyrics.js";
 import {
   MAX_LISTEN_MS, getOpenAIKey, mountVoiceSettings, startBrowserRecording,
   pcmToWav, transcribe, findSongs,
@@ -802,6 +804,8 @@ function renderPreview() {
 function renderPreviewLyrics() {
   $("preview-lyrics").hidden = !lyricsEnabled();
   $("preview-lyrics").textContent = lyricsText();
+  $("lyrics-help").hidden = !lyricsEnabled();
+  if (lyricsEnabled()) renderLyricsHelp($("lyrics-help"), lyrics, isLoggedIn() ? playback.state?.item : null);
 }
 
 function render() {
