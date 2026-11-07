@@ -73,7 +73,7 @@ button.choice.on { background: #1db954; border-color: #1db954; color: #000; }
 #preview-menu li.carousel {
   white-space: pre;
   overflow: hidden;
-  text-align: center;
+  text-align: left; /* the line carries its own centring spaces, like on the glasses */
   cursor: pointer;
   user-select: none;
 }

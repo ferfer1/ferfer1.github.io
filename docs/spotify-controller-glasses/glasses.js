@@ -33,6 +33,8 @@ import {
   AudioInputSource,
 } from "./vendor/even_hub_sdk.js";
 import { ART_SIZE, getArt, drawGreenPreview } from "./art.js";
+// Even's measurements of the glasses' own font, to lay out and centre text in real pixels.
+import { getTextWidth, pxTruncate } from "./vendor/g2_font_measure.js";
 import { store } from "../spotify-controller/storage.js";
 import {
   redirectUri, getClientId, setClientId, login, handleRedirect, isLoggedIn, logout,
@@ -73,7 +75,10 @@ const ART = { id: 3, name: "art" };
 const LYRICS = { id: 4, name: "lyrics" };
 const MENU_TEXT = { id: 5, name: "carousel" }; // the carousel menu's text box
 const MENU_H = 44;                              // carousel box height: one line + border/padding
-const CAROUSEL_WIDTH = 40;                      // characters that fit on the carousel line
+const MENU_BORDER = 1;
+const MENU_PADDING = 4;
+// Pixels available for text inside the carousel box (a few px spare so it never wraps).
+const CAROUSEL_PX = 576 - 2 * (MENU_BORDER + MENU_PADDING) - 4;
 const TEXT_X = ART_SIZE + 8; // info text sits to the right of the album art
 
 // ---------- Menu settings (changed on the phone screen) ----------
@@ -238,17 +243,41 @@ function menuText() {
   selected = Math.min(selected, items.length - 1);
   const n = items.length;
   const current = items[selected].label;
-  if (n === 1) return `[ ${clip(current, CAROUSEL_WIDTH - 4)} ]`;
+  const W = CAROUSEL_PX;
+
+  if (n === 1) return centerLine(`[ ${pxTruncate(current, W - getTextWidth("[  ]"))} ]`, W);
 
   if (screen === "controls") {
-    const prev = items[(selected - 1 + n) % n].label;
-    const next = items[(selected + 1) % n].label;
-    const middle = `[ ${clip(current, 20)} ]`;
-    const side = Math.max(4, Math.floor((CAROUSEL_WIDTH - middle.length - 8) / 2));
-    return `< ${clip(prev, side)}  ${middle}  ${clip(next, side)} >`;
+    // The highlighted option goes exactly in the middle; neighbours fill the space either side.
+    const middle = `[ ${pxTruncate(current, Math.round(W * 0.45))} ]`;
+    const gap = "   ";
+    const side = Math.floor((W - getTextWidth(middle)) / 2 - getTextWidth(gap));
+    const left = `< ${pxTruncate(items[(selected - 1 + n) % n].label, side - getTextWidth("< "))}`;
+    const right = `${pxTruncate(items[(selected + 1) % n].label, side - getTextWidth(" >"))} >`;
+    // Pad the left side so the middle item's centre lands on the box's centre.
+    const leftPart = left + gap;
+    const lead = W / 2 - getTextWidth(middle) / 2 - getTextWidth(leftPart);
+    return spaces(lead) + leftPart + middle + gap + right;
   }
-  const position = `${selected + 1}/${n}`;
-  return `<  [ ${clip(current, CAROUSEL_WIDTH - position.length - 10)} ]  >  ${position}`;
+
+  // Long lists (playlists, results…): one item at a time, centred, with its position after it.
+  const left = "<   ";
+  const right = `   >   ${selected + 1}/${n}`;
+  const sideW = Math.max(getTextWidth(left), getTextWidth(right)); // reserve the wider side on both
+  const middle = `[ ${pxTruncate(current, W - 2 * sideW - getTextWidth("[  ]"))} ]`;
+  const lead = W / 2 - getTextWidth(middle) / 2 - getTextWidth(left);
+  return spaces(lead) + left + middle + right;
+}
+
+/** Spaces adding up to roughly `px` pixels (text boxes on the glasses are left-aligned). */
+function spaces(px) {
+  const count = Math.max(0, Math.round(px / getTextWidth(" ")));
+  return " ".repeat(count);
+}
+
+/** Centre one line of text in a box `width` px wide by padding it with leading spaces. */
+function centerLine(text, width) {
+  return spaces((width - getTextWidth(text)) / 2) + text;
 }
 
 function infoText() {
@@ -339,7 +368,7 @@ function pageLayout() {
     // One-line menu box along the bottom; it receives the swipes and taps.
     textObject.push(new TextContainerProperty({
       xPosition: 0, yPosition: 288 - MENU_H, width: 576, height: MENU_H,
-      borderWidth: 1, borderColor: 8, borderRadius: 6, paddingLength: 4,
+      borderWidth: MENU_BORDER, borderColor: 8, borderRadius: 6, paddingLength: MENU_PADDING,
       containerID: MENU_TEXT.id, containerName: MENU_TEXT.name,
       content: menuText(),
       isEventCapture: 1,
