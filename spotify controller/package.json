@@ -1,9 +1,0 @@
-{
-  "name": "spotify-controller",
-  "version": "1.0.0",
-  "private": true,
-  "description": "See what's playing on Spotify and control playback.",
-  "scripts": {
-    "start": "node server.js"
-  }
-}
