@@ -31,6 +31,8 @@ import {
   ImageRawDataUpdate,
   OsEventTypeList,
   AudioInputSource,
+  MenuContainerProperty,
+  MenuItemProperty,
 } from "./vendor/even_hub_sdk.js";
 import { ART_SIZE, getArt, drawGreenPreview } from "./art.js";
 // Even's measurements of the glasses' own font, to lay out and centre text in real pixels.
@@ -50,14 +52,16 @@ import {
 } from "../spotify-controller/voice.js";
 
 const CONTROLS = [
-  { label: "Rewind 10s", action: "rewind", done: "Rewound 10s" },
-  { label: "Previous", action: "previous", done: "Previous track" },
-  { label: "Play / Pause", action: "toggle" },
-  { label: "Skip", action: "next", done: "Skipped" },
-  { label: "Playlists", open: "playlists" },
-  { label: () => `Lyrics: ${lyricsEnabled() ? "On" : "Off"}`, key: "lyrics", toggleLyrics: true },
-  { label: "Find a song (mic)", key: "voice", voice: true },
+  // `id` is the item's number in the glasses' tap-and-hold menu (must be unique and non-zero).
+  { id: 1, label: "Rewind 10s", action: "rewind", done: "Rewound 10s" },
+  { id: 2, label: "Previous", action: "previous", done: "Previous track" },
+  { id: 3, label: "Play / Pause", action: "toggle" },
+  { id: 4, label: "Skip", action: "next", done: "Skipped" },
+  { id: 5, label: "Playlists", open: "playlists" },
+  { id: 6, label: () => `Lyrics: ${lyricsEnabled() ? "On" : "Off"}`, key: "lyrics", toggleLyrics: true },
+  { id: 7, label: "Find a song (mic)", key: "voice", voice: true },
 ];
+const labelOf = (control) => (typeof control.label === "function" ? control.label() : control.label);
 
 // Voice-search screens; double-tap on any of them cancels back to the controls.
 const VOICE_SCREENS = ["listening", "searching", "results", "pickPlaylist"];
@@ -179,10 +183,33 @@ function currentItems() {
     return items;
   }
   return CONTROLS.map((c) => ({
-    label: typeof c.label === "function" ? c.label() : c.label,
+    label: labelOf(c),
     key: c.key,
     run: () => pressControl(c),
   }));
+}
+
+/**
+ * The glasses' tap-and-hold menu: the same options as the carousel.
+ * It has to be included in every page (re)draw, or the glasses drop it.
+ */
+function holdMenu() {
+  return new MenuContainerProperty({
+    menuItems: CONTROLS.map((c) => new MenuItemProperty({ itemID: c.id, itemName: labelOf(c) })),
+  });
+}
+
+/** An option was picked from the tap-and-hold menu. */
+function onHoldMenuPick(itemID) {
+  const control = CONTROLS.find((c) => c.id === itemID);
+  if (!control || isRepeat(`menu:${itemID}`)) return;
+  // Leave voice search first (stops the mic), unless it's just the lyrics switch.
+  if (VOICE_SCREENS.includes(screen) && !control.toggleLyrics) {
+    voice.run++;
+    stopMic();
+    setScreen("controls");
+  }
+  pressControl(control);
 }
 
 // Song title/artist in Latin letters when available (the glasses' font may lack e.g. Japanese).
@@ -373,7 +400,7 @@ function pageLayout() {
       content: menuText(),
       isEventCapture: 1,
     }));
-    return { containerTotalNum: 1 + textObject.length, imageObject, textObject };
+    return { containerTotalNum: 1 + textObject.length, imageObject, textObject, menuObject: holdMenu() };
   }
 
   const items = currentItems();
@@ -382,6 +409,7 @@ function pageLayout() {
     containerTotalNum: 2 + textObject.length,
     imageObject,
     textObject,
+    menuObject: holdMenu(),
     listObject: [new ListContainerProperty({
       // Can be shortened with the phone's "Menu height" setting.
       xPosition: 0, yPosition: listY, width: 576, height: Math.max(40, 288 - listY - menuTrim()),
@@ -552,6 +580,12 @@ function handleGlassesEvent(event) {
   if (event.audioEvent) {
     const pcm = event.audioEvent.audioPcm;
     if (voice.recordingGlasses && pcm?.length) voice.pcm.push(pcm instanceof Uint8Array ? pcm : Uint8Array.from(pcm));
+    return;
+  }
+
+  // An option picked from the glasses' tap-and-hold menu.
+  if (event.menuItemClickEvent) {
+    onHoldMenuPick(Number(event.menuItemClickEvent.itemID));
     return;
   }
 
