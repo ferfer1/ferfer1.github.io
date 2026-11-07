@@ -2,79 +2,54 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Spotify Controller</title>
-  <link rel="stylesheet" href="style.css" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Spotify Controller · Glasses</title>
+  <link rel="stylesheet" href="../spotify-controller/style.css" />
+  <link rel="stylesheet" href="glasses.css" />
 </head>
 <body>
   <main class="card">
-    <!-- Setup: enter Client ID -->
+    <h1>Spotify · Glasses</h1>
+    <p id="bridge-status" class="hint">Connecting to glasses…</p>
+
+    <!-- Client ID (only shown if not set in config.js) -->
     <section id="setup" hidden>
-      <h1>Spotify Controller</h1>
-      <p>Paste the <strong>Client ID</strong> from your Spotify Developer app.</p>
-      <p class="hint">Redirect URI to register in the dashboard:<br /><code id="redirect-uri"></code></p>
+      <p>Paste your Spotify <strong>Client ID</strong>.</p>
+      <p class="hint">Redirect URI to register:<br /><code id="redirect-uri"></code></p>
       <input id="client-id" type="text" placeholder="Client ID" autocomplete="off" />
       <button id="save-client" class="primary">Save</button>
     </section>
 
-    <!-- Login -->
     <section id="login" hidden>
-      <h1>Spotify Controller</h1>
-      <p>Connect your Spotify account to get started.</p>
+      <p>Connect Spotify to control it from your glasses.</p>
       <button id="login-btn" class="primary">Connect with Spotify</button>
-      <button id="reset-client" class="link">Change Client ID</button>
     </section>
 
-    <!-- Player -->
-    <section id="player" hidden>
-      <img id="art" alt="" />
-      <div class="meta">
-        <div id="title">Nothing playing</div>
-        <div id="artist"></div>
-        <div id="device" class="hint"></div>
+    <!-- Live preview of what the glasses show. Also usable as a remote in a normal browser. -->
+    <section id="preview" hidden>
+      <p class="hint">On the glasses: scroll to pick, tap to press, double-tap to go back / exit.</p>
+      <div class="lens">
+        <div class="lens-top">
+          <canvas id="preview-art" width="120" height="120"></canvas>
+          <pre id="preview-info"></pre>
+        </div>
+        <pre id="preview-lyrics"></pre>
+        <ul id="preview-menu"></ul>
       </div>
-
-      <div class="progress">
-        <span id="elapsed">0:00</span>
-        <div class="bar"><div id="bar-fill"></div></div>
-        <span id="duration">0:00</span>
+      <p class="hint">Preview: ↑/↓ and Enter (Esc = back), or tap an item.</p>
+      <div class="adjust">
+        <span>Menu height on glasses</span>
+        <button id="menu-shorter" class="step" aria-label="Shorter">−</button>
+        <span id="menu-trim"></span>
+        <button id="menu-taller" class="step" aria-label="Taller">+</button>
       </div>
-
-      <div class="controls">
-        <button id="prev" title="Previous track">&#9198;</button>
-        <button id="rewind" title="Rewind 10 seconds">&#8634;10</button>
-        <button id="play-pause" class="big" title="Play / Pause">&#9654;</button>
-        <button id="next" title="Skip">&#9197;</button>
-      </div>
-
-      <div id="message" class="hint"></div>
-
-      <div class="lyrics-head">
-        <span>Lyrics</span>
-        <button id="lyrics-toggle" class="switch" role="switch" aria-checked="true">On</button>
-      </div>
-      <div id="lyrics" class="lyrics-box"></div>
+      <p class="hint">Normally leave this at "full". Tap − only if the menu runs off the bottom of the glasses display.</p>
       <div id="romaji-tools"></div>
-
-      <button id="playlists-toggle" class="secondary">Playlists</button>
-      <div id="playlists" hidden>
-        <input id="playlist-search" type="search" placeholder="Search your playlists" autocomplete="off" />
-        <ul id="playlist-list"></ul>
-      </div>
-
-      <button id="voice-btn" class="mic">🎤 Find a song by voice</button>
-      <div id="voice-panel" class="voice-panel" hidden>
-        <p id="voice-status"></p>
-        <ul id="voice-results" class="pick-list"></ul>
-        <button id="voice-cancel" class="link">Close</button>
-      </div>
       <div id="voice-settings"></div>
-
-      <a class="link" href="../spotify-controller-glasses/">Glasses version</a>
       <button id="logout" class="link">Disconnect</button>
     </section>
   </main>
 
-  <script type="module" src="app.js"></script>
+  <script type="module" src="glasses.js"></script>
 </body>
 </html>
