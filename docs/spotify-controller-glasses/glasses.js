@@ -50,8 +50,8 @@ import {
 } from "../spotify-controller/voice.js";
 
 const CONTROLS = [
-  { label: "Previous", action: "previous", done: "Previous track" },
   { label: "Rewind 10s", action: "rewind", done: "Rewound 10s" },
+  { label: "Previous", action: "previous", done: "Previous track" },
   { label: "Play / Pause", action: "toggle" },
   { label: "Skip", action: "next", done: "Skipped" },
   { label: "Playlists", open: "playlists" },
@@ -494,7 +494,7 @@ async function pushText(t) {
 
 function setScreen(next) {
   screen = next;
-  selected = 0;
+  selected = next === "controls" ? HOME_INDEX : 0; // back on the controls → Play / Pause
   if (!carousel()) rebuildPage(); // the built-in list must be redrawn to change its items
   render();                       // the carousel just updates its text
 }
@@ -743,7 +743,7 @@ function toggleLyrics() {
 // ---------- Menu style & swipe direction (phone screen) ----------
 function setMenuStyle(style) {
   store.set("menu_style", style);
-  selected = 0;
+  selected = screen === "controls" ? HOME_INDEX : 0;
   showMenuSettings();
   rebuildPage(); // swap carousel ⇄ built-in list on the glasses
   render();
@@ -799,7 +799,9 @@ async function refresh() {
 }
 
 // ---------- Phone screen / browser preview ----------
-let selected = 0; // highlighted menu item (carousel) / preview highlight (list)
+// The controls screen starts with Play / Pause highlighted.
+const HOME_INDEX = CONTROLS.findIndex((c) => c.action === "toggle");
+let selected = HOME_INDEX; // highlighted menu item (carousel) / preview highlight (list)
 
 function renderPreview() {
   $("preview-info").textContent = infoText();
