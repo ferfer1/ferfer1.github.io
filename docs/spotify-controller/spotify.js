@@ -1,6 +1,7 @@
 // Shared Spotify login + playback helpers used by both /spotify-controller/ and /spotify-controller-glasses/.
 // Uses Authorization Code + PKCE, so it runs entirely in the browser (works on GitHub Pages).
 import { CLIENT_ID } from "./config.js";
+import { store } from "./storage.js"; // saved under "spotify:" names
 
 const SCOPES = [
   "user-read-playback-state",
@@ -13,12 +14,6 @@ const SCOPES = [
 ].join(" ");
 const API = "https://api.spotify.com/v1";
 export const REWIND_MS = 10000;
-
-const store = {
-  get: (k) => localStorage.getItem(k),
-  set: (k, v) => localStorage.setItem(k, v),
-  del: (k) => localStorage.removeItem(k),
-};
 
 // The page's own address is used as the redirect URI, e.g.
 //   https://<user>.github.io/spotify-controller/          (main page)

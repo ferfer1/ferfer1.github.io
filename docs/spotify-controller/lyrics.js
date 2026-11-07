@@ -8,14 +8,15 @@
 // Spotify's own lyrics aren't available through its public API.
 
 import { getContextTracks } from "./spotify.js";
+import { store } from "./storage.js";
 
 const LRCLIB = "https://lrclib.net/api";
 const KUROMOJI_DICT = "https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict/";
 const vendor = (file) => new URL(`./vendor/${file}`, import.meta.url).href;
 
 // ---------- On/off setting (on by default) ----------
-export const lyricsEnabled = () => localStorage.getItem("lyrics_on") !== "0";
-export const setLyricsEnabled = (on) => localStorage.setItem("lyrics_on", on ? "1" : "0");
+export const lyricsEnabled = () => store.get("lyrics_on") !== "0";
+export const setLyricsEnabled = (on) => store.set("lyrics_on", on ? "1" : "0");
 
 // ---------- Script detection ----------
 const KANA = /[぀-ヿㇰ-ㇿｦ-ﾟ]/;
@@ -122,7 +123,7 @@ const ROMAJI_INSTRUCTIONS =
   "Write long vowels with doubled letters (ou, uu, ei, aa) and never use macrons. " +
   "Keep English words and punctuation as they are. Never translate.";
 
-const openAIKey = () => localStorage.getItem("openai_key") || ""; // set in Voice search settings
+const openAIKey = () => store.get("openai_key") || ""; // set in Voice search settings
 
 async function openAIRomaji(texts) {
   let lastError;
@@ -177,39 +178,94 @@ async function japaneseToRomajiMany(texts, { allowDictionary = true } = {}) {
 }
 
 // --- Saved romaji, so a song is only ever sent to OpenAI once ---
-// Stored in this browser's localStorage ("romaji_cache"). Each entry keeps only the romaji
-// plus a short fingerprint of the original lyrics (to notice if the lyrics change).
-// Capped at ~2 MB (≈500 Japanese songs, under half the usual 5 MB per-site limit);
-// when full, the songs played least recently are dropped first.
-const ROMAJI_CACHE = "romaji_cache";
-const ROMAJI_CACHE_MAX_CHARS = 1_000_000; // localStorage uses 2 bytes per char → ~2 MB
+// Stored in this browser's IndexedDB (database "spotify-controller", table "romaji"), which is
+// meant for larger data and is separate from the ~5 MB localStorage that all apps on
+// ferfer1.github.io share. Each entry keeps the romaji plus a short fingerprint of the
+// original lyrics (to notice if they change). Capped at 5,000 songs (~20 MB); when full,
+// the songs played least recently are dropped first.
+const DB_NAME = "spotify-controller";
+const DB_STORE = "romaji";
+const ROMAJI_MAX_SONGS = 5000;
 
-let romajiCache = null; // in-memory copy, so the 2 MB isn't re-parsed for every song
-function loadRomajiCache() {
-  if (!romajiCache) {
-    try { romajiCache = JSON.parse(localStorage.getItem(ROMAJI_CACHE) || "{}"); } catch { romajiCache = {}; }
-  }
-  return romajiCache;
+const asPromise = (request) => new Promise((resolve, reject) => {
+  request.onsuccess = () => resolve(request.result);
+  request.onerror = () => reject(request.error);
+});
+
+let dbPromise = null;
+const memoryFallback = new Map(); // only used if IndexedDB is unavailable (not saved across visits)
+
+/** Open the database (once). Resolves to null if IndexedDB can't be used. */
+function openDb() {
+  dbPromise ??= new Promise((resolve) => {
+    if (!self.indexedDB) return resolve(null);
+    const timer = setTimeout(() => resolve(null), 4000);
+    let request;
+    try {
+      request = indexedDB.open(DB_NAME, 1);
+    } catch {
+      clearTimeout(timer);
+      return resolve(null);
+    }
+    request.onupgradeneeded = () => {
+      request.result.createObjectStore(DB_STORE, { keyPath: "key" }).createIndex("at", "at");
+    };
+    request.onsuccess = async () => {
+      clearTimeout(timer);
+      const db = request.result;
+      await moveOldRomajiCache(db).catch((e) => console.warn("Couldn't move old saved romaji:", e));
+      navigator.storage?.persist?.().catch(() => {}); // ask the browser not to clear it under pressure
+      resolve(db);
+    };
+    request.onerror = request.onblocked = () => { clearTimeout(timer); resolve(null); };
+  });
+  return dbPromise;
 }
 
-function saveRomajiCache() {
-  const cache = loadRomajiCache();
-  let json = JSON.stringify(cache);
-  const oldestFirst = Object.keys(cache).sort((a, b) => cache[a].at - cache[b].at);
-  while (json.length > ROMAJI_CACHE_MAX_CHARS && oldestFirst.length > 1) {
-    delete cache[oldestFirst.shift()];
-    json = JSON.stringify(cache);
+/** Older versions saved romaji in localStorage ("romaji_cache"); move it into IndexedDB once. */
+async function moveOldRomajiCache(db) {
+  const raw = localStorage.getItem("romaji_cache") ?? localStorage.getItem("spotify:romaji_cache");
+  if (!raw) return;
+  const old = JSON.parse(raw);
+  const tx = db.transaction(DB_STORE, "readwrite");
+  for (const [key, e] of Object.entries(old)) {
+    if (!Array.isArray(e?.out)) continue;
+    const h = e.h ?? (Array.isArray(e.texts) ? fingerprint(e.texts) : null);
+    if (h) tx.objectStore(DB_STORE).put({ key, at: e.at || Date.now(), h, out: e.out, size: JSON.stringify(e.out).length * 2 });
   }
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      localStorage.setItem(ROMAJI_CACHE, json);
-      return;
-    } catch {
-      // Storage full (other data on the site): drop the oldest quarter and retry.
-      oldestFirst.splice(0, Math.max(1, Math.floor(oldestFirst.length / 4))).forEach((k) => delete cache[k]);
-      json = JSON.stringify(cache);
-    }
-  }
+  await new Promise((resolve, reject) => { tx.oncomplete = resolve; tx.onerror = () => reject(tx.error); });
+  localStorage.removeItem("romaji_cache");
+  localStorage.removeItem("spotify:romaji_cache");
+}
+
+async function dbGet(key) {
+  const db = await openDb();
+  if (!db) return memoryFallback.get(key);
+  return asPromise(db.transaction(DB_STORE).objectStore(DB_STORE).get(key));
+}
+
+async function dbPut(entry, { trim = true } = {}) {
+  const db = await openDb();
+  if (!db) { memoryFallback.set(entry.key, entry); return; }
+  await asPromise(db.transaction(DB_STORE, "readwrite").objectStore(DB_STORE).put(entry));
+  if (trim) await trimRomaji(db);
+}
+
+/** Drop the least recently played songs beyond the cap. */
+async function trimRomaji(db) {
+  const store = db.transaction(DB_STORE, "readwrite").objectStore(DB_STORE);
+  let extra = (await asPromise(store.count())) - ROMAJI_MAX_SONGS;
+  if (extra <= 0) return;
+  await new Promise((resolve, reject) => {
+    const cursorRequest = store.index("at").openCursor(); // oldest first
+    cursorRequest.onsuccess = () => {
+      const cursor = cursorRequest.result;
+      if (!cursor || extra-- <= 0) return resolve();
+      cursor.delete();
+      cursor.continue();
+    };
+    cursorRequest.onerror = () => reject(cursorRequest.error);
+  });
 }
 
 /** Short fingerprint of a song's original texts (FNV-1a hash + length). */
@@ -220,39 +276,42 @@ function fingerprint(texts) {
   return `${(h >>> 0).toString(36)}.${s.length}`;
 }
 
-function readRomajiCache(songKey, texts) {
-  const entry = loadRomajiCache()[songKey];
-  if (!entry) return null;
-  // Older saves stored the full texts; newer ones store only a fingerprint.
-  const matches = entry.h ? entry.h === fingerprint(texts) : entry.texts?.join("\n") === texts.join("\n");
-  if (!matches || !Array.isArray(entry.out) || entry.out.length !== texts.length) return null;
-  if (!entry.h || Date.now() - entry.at > 60_000) { // mark as recently played (and compact old saves)
-    loadRomajiCache()[songKey] = { at: Date.now(), h: fingerprint(texts), out: entry.out };
-    saveRomajiCache();
+async function readRomajiCache(songKey, texts) {
+  let entry;
+  try { entry = await dbGet(songKey); } catch { return null; }
+  if (!entry || entry.h !== fingerprint(texts)) return null;
+  if (!Array.isArray(entry.out) || entry.out.length !== texts.length) return null;
+  if (Date.now() - entry.at > 60_000) { // mark as recently played
+    dbPut({ ...entry, at: Date.now() }, { trim: false }).catch(() => {});
   }
   return entry.out;
 }
 
-function writeRomajiCache(songKey, texts, out) {
-  loadRomajiCache()[songKey] = { at: Date.now(), h: fingerprint(texts), out };
-  saveRomajiCache();
+async function writeRomajiCache(songKey, texts, out) {
+  try {
+    await dbPut({ key: songKey, at: Date.now(), h: fingerprint(texts), out, size: JSON.stringify(out).length * 2 });
+  } catch (e) {
+    console.warn("Couldn't save romaji:", e); // e.g. storage full; the romaji still shows this time
+  }
 }
 
-/** How much romaji is saved on this device: { songs, kb }. */
-export function romajiCacheStats() {
-  const cache = loadRomajiCache();
-  return { songs: Object.keys(cache).length, kb: Math.round((JSON.stringify(cache).length * 2) / 1024) };
+/** How much romaji is saved on this device: { songs, kb, persistent }. */
+export async function romajiCacheStats() {
+  const db = await openDb();
+  if (!db) return { songs: memoryFallback.size, kb: 0, persistent: false };
+  const all = await asPromise(db.transaction(DB_STORE).objectStore(DB_STORE).getAll());
+  return { songs: all.length, kb: Math.round(all.reduce((n, e) => n + (e.size || 0), 0) / 1024), persistent: true };
 }
 
 /** Romanize a song's texts (title, artist, lyric lines); Latin-only texts come back as null. */
 async function japaneseSongToRomaji(songKey, texts, options) {
-  const cached = readRomajiCache(songKey, texts);
+  const cached = await readRomajiCache(songKey, texts);
   if (cached) return cached;
   const needed = texts.filter((t) => t && NON_LATIN.test(t));
   const converted = await japaneseToRomajiMany(needed, options);
   let j = 0;
   const out = texts.map((t) => (t && NON_LATIN.test(t) ? converted[j++] : null));
-  writeRomajiCache(songKey, texts, out);
+  await writeRomajiCache(songKey, texts, out);
   return out;
 }
 
@@ -405,7 +464,7 @@ export async function romanizeTracksNow(tracks, { onProgress = () => {}, isCance
         if (!found) stats.noLyrics++;
         if (!song.japanese) {
           if (found) stats.notJapanese++;
-        } else if (readRomajiCache(songKey(item), song.texts)) {
+        } else if (await readRomajiCache(songKey(item), song.texts)) {
           stats.alreadySaved++;
         } else if (!isCancelled()) {
           await japaneseSongToRomaji(songKey(item), song.texts, { allowDictionary: false });
@@ -438,9 +497,11 @@ export function mountRomajiTools(container, getPlaybackState) {
   const btn = container.querySelector(".rp-btn");
   const status = container.querySelector(".rp-status");
   const storage = container.querySelector(".rp-storage");
-  const showStorage = () => {
-    const { songs, kb } = romajiCacheStats();
-    storage.textContent = `Saved romaji on this device: ${songs} song${songs === 1 ? "" : "s"} (${kb} KB of ~2 MB)`;
+  const showStorage = async () => {
+    const { songs, kb, persistent } = await romajiCacheStats();
+    storage.textContent = persistent
+      ? `Saved romaji on this device: ${songs} song${songs === 1 ? "" : "s"} (${kb} KB)`
+      : "This browser can't save romaji, so it's redone each visit.";
   };
 
   let running = false;

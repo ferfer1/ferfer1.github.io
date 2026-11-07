@@ -1,10 +1,11 @@
 // Voice search: record someone saying or singing a song, transcribe it with OpenAI,
 // find the song (Genius lyric search + Spotify search), and return the top matches.
 //
-// API keys are stored only in this browser's localStorage, never on GitHub.
+// API keys are stored only in this browser's localStorage ("spotify:" names), never on GitHub.
 // Note: the Even app's built-in browser has its own storage, so keys must be
 // entered once on the glasses page (inside the Even app) as well.
 import { searchTracks } from "./spotify.js";
+import { store } from "./storage.js";
 
 const OPENAI_URL = "https://api.openai.com/v1/audio/transcriptions";
 const OPENAI_MODELS = ["gpt-4o-mini-transcribe", "whisper-1"]; // try in order
@@ -12,11 +13,11 @@ const GENIUS_URL = "https://api.genius.com/search";
 export const MAX_LISTEN_MS = 10000;
 
 // ---------- Keys ----------
-export const getOpenAIKey = () => localStorage.getItem("openai_key") || "";
-export const getGeniusToken = () => localStorage.getItem("genius_token") || "";
+export const getOpenAIKey = () => store.get("openai_key") || "";
+export const getGeniusToken = () => store.get("genius_token") || "";
 function saveKey(name, value) {
   value = value.trim();
-  if (value) localStorage.setItem(name, value); else localStorage.removeItem(name);
+  if (value) store.set(name, value); else store.del(name);
 }
 
 /** Builds the "Voice search settings" box inside `container`. */
