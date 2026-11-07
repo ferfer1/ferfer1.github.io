@@ -194,6 +194,49 @@ export async function getPlaylists({ reload = false } = {}) {
   return all;
 }
 
+/**
+ * Tracks of the playlist or album that's currently playing (up to `max`).
+ * Returns { name, tracks } — tracks look like Spotify track objects (id, name, artists, album, duration_ms).
+ */
+export async function getContextTracks(context, max = 300) {
+  if (!context?.uri || !["playlist", "album"].includes(context.type)) {
+    throw new Error("Play a playlist or album first.");
+  }
+  const id = context.uri.split(":").pop();
+  const tracks = [];
+
+  if (context.type === "album") {
+    const album = await spotify("GET", `/albums/${id}`);
+    let page = album.tracks;
+    while (page && tracks.length < max) {
+      tracks.push(...(page.items ?? []).map((t) => ({ ...t, album: { name: album.name } })));
+      page = page.next ? await spotify("GET", page.next.replace(API, "")) : null;
+    }
+    return { name: album.name, tracks: tracks.slice(0, max) };
+  }
+
+  const info = await spotify("GET", `/playlists/${id}?fields=name`, undefined, {
+    403: "Spotify won't share this playlist's songs with the app.",
+    404: "This playlist couldn't be found (Spotify-made playlists can't be read by apps).",
+  });
+  // Newer API name first, then the older one.
+  let path = `/playlists/${id}/items?limit=50`;
+  try {
+    await spotify("GET", path.replace("limit=50", "limit=1"), undefined, { 404: "notfound" });
+  } catch (e) {
+    if (e.status === 404) path = `/playlists/${id}/tracks?limit=50`; else throw e;
+  }
+  while (path && tracks.length < max) {
+    const page = await spotify("GET", path, undefined, { 403: "Spotify won't share this playlist's songs with the app." });
+    for (const entry of page?.items ?? []) {
+      const t = entry?.item ?? entry?.track; // field name differs between API versions
+      if (t?.id && t.type !== "episode") tracks.push(t);
+    }
+    path = page?.next ? page.next.replace(API, "") : null;
+  }
+  return { name: info?.name || "this playlist", tracks: tracks.slice(0, max) };
+}
+
 // ---------- Search & adding songs ----------
 let meCache = null;
 /** The logged-in Spotify user ({ id, display_name, ... }). */

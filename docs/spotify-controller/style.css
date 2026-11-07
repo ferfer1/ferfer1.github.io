@@ -136,6 +136,8 @@ button.switch[aria-checked="false"] { background: #3e3e3e; color: #b3b3b3; }
 .lyric .roman { display: block; font-size: 0.8rem; font-weight: 400; color: #1db954; }
 .lyric.current .roman { color: #1ed760; }
 .lyrics-note { color: #a7a7a7; font-size: 0.85rem; padding: 6px 0; }
+.romaji-tools { margin-top: 10px; }
+.romaji-tools .hint { margin: 6px 0 0; }
 
 button.secondary {
   width: 100%;

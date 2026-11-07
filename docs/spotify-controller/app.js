@@ -6,7 +6,7 @@ import {
   getPlaylists, controls,
   editablePlaylists, currentEditablePlaylist, addTrackToPlaylist,
 } from "./spotify.js";
-import { LyricsTracker, lyricsEnabled, setLyricsEnabled } from "./lyrics.js";
+import { LyricsTracker, lyricsEnabled, setLyricsEnabled, mountRomajiTools } from "./lyrics.js";
 import {
   MAX_LISTEN_MS, getOpenAIKey, mountVoiceSettings, startBrowserRecording,
   browserSpeechAvailable, startBrowserSpeech, transcribe, findSongs,
@@ -310,6 +310,7 @@ async function closeVoice() {
 
 function wireControls() {
   mountVoiceSettings($("voice-settings"));
+  mountRomajiTools($("romaji-tools"), () => playback.state);
   $("voice-btn").onclick = onMicClick;
   $("voice-cancel").onclick = closeVoice;
   $("lyrics-toggle").onclick = () => { setLyricsEnabled(!lyricsEnabled()); renderLyrics(true); };

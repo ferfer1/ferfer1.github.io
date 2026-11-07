@@ -7,6 +7,8 @@
 //   Russian / Ukrainian (Cyrillic) → Latin letters (built-in table)
 // Spotify's own lyrics aren't available through its public API.
 
+import { getContextTracks } from "./spotify.js";
+
 const LRCLIB = "https://lrclib.net/api";
 const KUROMOJI_DICT = "https://cdn.jsdelivr.net/npm/kuromoji@0.1.2/dict/";
 const vendor = (file) => new URL(`./vendor/${file}`, import.meta.url).href;
@@ -143,16 +145,21 @@ async function openAIRomaji(texts) {
       if (!Array.isArray(lines)) throw new Error("OpenAI returned no romaji");
       return texts.map((_, i) => (typeof lines[i] === "string" ? tidy(lines[i]) : null));
     }
+    if (res.status === 401) throw new Error("OpenAI rejected the API key.");
+    if (res.status === 429) throw new Error("OpenAI quota or rate limit reached.");
     let msg = `OpenAI error (${res.status})`;
     try { msg = (await res.json()).error?.message || msg; } catch {}
     lastError = new Error(msg);
-    if (res.status === 401 || res.status === 429 || !/model/i.test(msg)) break; // only retry on "unknown model"
+    if (!/model/i.test(msg)) break; // only try the next model on "unknown model" errors
   }
   throw lastError;
 }
 
-/** Japanese → romaji for many texts: OpenAI if there's a key, else the dictionary worker. */
-async function japaneseToRomajiMany(texts) {
+/**
+ * Japanese → romaji for many texts: OpenAI if there's a key, else the dictionary worker.
+ * With allowDictionary: false, OpenAI errors are thrown instead of falling back.
+ */
+async function japaneseToRomajiMany(texts, { allowDictionary = true } = {}) {
   if (!texts.length) return [];
   const unique = [...new Set(texts)]; // choruses repeat; convert each line once
   let converted;
@@ -160,6 +167,7 @@ async function japaneseToRomajiMany(texts) {
     try {
       converted = await openAIRomaji(unique);
     } catch (e) {
+      if (!allowDictionary) throw e;
       console.warn("OpenAI romaji failed, trying the dictionary instead:", e);
     }
   }
@@ -168,37 +176,80 @@ async function japaneseToRomajiMany(texts) {
   return texts.map((t) => byText.get(t) ?? null);
 }
 
-// --- Saved romaji, so replaying a song is instant ---
+// --- Saved romaji, so a song is only ever sent to OpenAI once ---
+// Stored in this browser's localStorage ("romaji_cache"). Each entry keeps only the romaji
+// plus a short fingerprint of the original lyrics (to notice if the lyrics change).
+// Capped at ~2 MB (≈500 Japanese songs, under half the usual 5 MB per-site limit);
+// when full, the songs played least recently are dropped first.
 const ROMAJI_CACHE = "romaji_cache";
-const ROMAJI_CACHE_MAX = 40; // songs
+const ROMAJI_CACHE_MAX_CHARS = 1_000_000; // localStorage uses 2 bytes per char → ~2 MB
+
+let romajiCache = null; // in-memory copy, so the 2 MB isn't re-parsed for every song
+function loadRomajiCache() {
+  if (!romajiCache) {
+    try { romajiCache = JSON.parse(localStorage.getItem(ROMAJI_CACHE) || "{}"); } catch { romajiCache = {}; }
+  }
+  return romajiCache;
+}
+
+function saveRomajiCache() {
+  const cache = loadRomajiCache();
+  let json = JSON.stringify(cache);
+  const oldestFirst = Object.keys(cache).sort((a, b) => cache[a].at - cache[b].at);
+  while (json.length > ROMAJI_CACHE_MAX_CHARS && oldestFirst.length > 1) {
+    delete cache[oldestFirst.shift()];
+    json = JSON.stringify(cache);
+  }
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      localStorage.setItem(ROMAJI_CACHE, json);
+      return;
+    } catch {
+      // Storage full (other data on the site): drop the oldest quarter and retry.
+      oldestFirst.splice(0, Math.max(1, Math.floor(oldestFirst.length / 4))).forEach((k) => delete cache[k]);
+      json = JSON.stringify(cache);
+    }
+  }
+}
+
+/** Short fingerprint of a song's original texts (FNV-1a hash + length). */
+function fingerprint(texts) {
+  const s = texts.join("\n");
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return `${(h >>> 0).toString(36)}.${s.length}`;
+}
 
 function readRomajiCache(songKey, texts) {
-  try {
-    const entry = JSON.parse(localStorage.getItem(ROMAJI_CACHE) || "{}")[songKey];
-    return entry && entry.texts.join("\n") === texts.join("\n") ? entry.out : null;
-  } catch {
-    return null;
+  const entry = loadRomajiCache()[songKey];
+  if (!entry) return null;
+  // Older saves stored the full texts; newer ones store only a fingerprint.
+  const matches = entry.h ? entry.h === fingerprint(texts) : entry.texts?.join("\n") === texts.join("\n");
+  if (!matches || !Array.isArray(entry.out) || entry.out.length !== texts.length) return null;
+  if (!entry.h || Date.now() - entry.at > 60_000) { // mark as recently played (and compact old saves)
+    loadRomajiCache()[songKey] = { at: Date.now(), h: fingerprint(texts), out: entry.out };
+    saveRomajiCache();
   }
+  return entry.out;
 }
 
 function writeRomajiCache(songKey, texts, out) {
-  try {
-    const cache = JSON.parse(localStorage.getItem(ROMAJI_CACHE) || "{}");
-    cache[songKey] = { at: Date.now(), texts, out };
-    const keys = Object.keys(cache).sort((a, b) => cache[b].at - cache[a].at);
-    keys.slice(ROMAJI_CACHE_MAX).forEach((k) => delete cache[k]);
-    localStorage.setItem(ROMAJI_CACHE, JSON.stringify(cache));
-  } catch {
-    // storage full or unavailable: just skip caching
-  }
+  loadRomajiCache()[songKey] = { at: Date.now(), h: fingerprint(texts), out };
+  saveRomajiCache();
+}
+
+/** How much romaji is saved on this device: { songs, kb }. */
+export function romajiCacheStats() {
+  const cache = loadRomajiCache();
+  return { songs: Object.keys(cache).length, kb: Math.round((JSON.stringify(cache).length * 2) / 1024) };
 }
 
 /** Romanize a song's texts (title, artist, lyric lines); Latin-only texts come back as null. */
-async function japaneseSongToRomaji(songKey, texts) {
+async function japaneseSongToRomaji(songKey, texts, options) {
   const cached = readRomajiCache(songKey, texts);
   if (cached) return cached;
   const needed = texts.filter((t) => t && NON_LATIN.test(t));
-  const converted = await japaneseToRomajiMany(needed);
+  const converted = await japaneseToRomajiMany(needed, options);
   let j = 0;
   const out = texts.map((t) => (t && NON_LATIN.test(t) ? converted[j++] : null));
   writeRomajiCache(songKey, texts, out);
@@ -313,6 +364,115 @@ async function findLyrics(item) {
     ?? null;
 }
 
+// ---------- Shared song analysis ----------
+const songKey = (item) => item.id || item.uri || item.name;
+
+/**
+ * Work out a song's lyric lines and what needs romanizing. Used by both the live player
+ * and "Romanize this playlist now", so they produce identical saved entries.
+ */
+function analyzeSong(item, found) {
+  const language = detectLanguage([item.name, found?.syncedLyrics || found?.plainLyrics || ""].join("\n"));
+  const synced = Boolean(found?.syncedLyrics);
+  const lines = !found ? []
+    : synced ? parseLrc(found.syncedLyrics)
+    : (found.plainLyrics || "").split(/\r?\n/).map((text) => ({ time: null, text: text.trim() }));
+  const todo = lines.filter((l) => NON_LATIN.test(l.text));
+  const artistText = item.artists?.map((a) => a.name).join(", ") ?? "";
+  const japanese = language === "ja" || KANA.test(item.name) || todo.some((l) => KANA.test(l.text));
+  return { language, synced, lines, todo, artistText, japanese, texts: [item.name, artistText, ...todo.map((l) => l.text)] };
+}
+
+// ---------- "Romanize this playlist now" ----------
+/**
+ * Pre-romanize every Japanese song in a list of Spotify tracks, so nothing waits while
+ * listening. Songs already saved are skipped (no tokens). Each song is one OpenAI request.
+ * onProgress({ total, checked, converted, alreadySaved, notJapanese, noLyrics, failed })
+ */
+export async function romanizeTracksNow(tracks, { onProgress = () => {}, isCancelled = () => false } = {}) {
+  if (!openAIKey()) throw new Error("Add your OpenAI key in Voice search settings first.");
+  const items = tracks.filter((t) => t && t.type !== "episode" && t.name);
+  const stats = { total: items.length, checked: 0, converted: 0, alreadySaved: 0, notJapanese: 0, noLyrics: 0, failed: 0 };
+  onProgress({ ...stats });
+
+  let next = 0;
+  const workerLoop = async () => {
+    while (next < items.length && !isCancelled() && !stats.stopped) {
+      const item = items[next++];
+      try {
+        const found = await findLyrics(item);
+        const song = analyzeSong(item, found);
+        if (!found) stats.noLyrics++;
+        if (!song.japanese) {
+          if (found) stats.notJapanese++;
+        } else if (readRomajiCache(songKey(item), song.texts)) {
+          stats.alreadySaved++;
+        } else if (!isCancelled()) {
+          await japaneseSongToRomaji(songKey(item), song.texts, { allowDictionary: false });
+          stats.converted++;
+        }
+      } catch (e) {
+        console.warn("Couldn't romanize", item.name, e);
+        stats.failed++;
+        if (/OpenAI rejected|quota or rate limit/.test(e.message)) { stats.stopped = e.message; throw e; }
+      }
+      stats.checked++;
+      onProgress({ ...stats });
+    }
+  };
+  await Promise.all([workerLoop(), workerLoop()]); // two songs at a time (gentle on LRCLIB/OpenAI)
+  return stats;
+}
+
+/**
+ * Builds the "Romanize this playlist now" button and the saved-romaji storage line.
+ * `getPlaybackState` returns Spotify's current playback state (for the playing playlist/album).
+ */
+export function mountRomajiTools(container, getPlaybackState) {
+  container.innerHTML = `
+    <div class="romaji-tools">
+      <button class="secondary rp-btn">Romanize this playlist now</button>
+      <p class="hint rp-status"></p>
+      <p class="hint rp-storage"></p>
+    </div>`;
+  const btn = container.querySelector(".rp-btn");
+  const status = container.querySelector(".rp-status");
+  const storage = container.querySelector(".rp-storage");
+  const showStorage = () => {
+    const { songs, kb } = romajiCacheStats();
+    storage.textContent = `Saved romaji on this device: ${songs} song${songs === 1 ? "" : "s"} (${kb} KB of ~2 MB)`;
+  };
+
+  let running = false;
+  let cancelled = false;
+  btn.onclick = async () => {
+    if (running) { cancelled = true; btn.textContent = "Stopping…"; return; }
+    running = true;
+    cancelled = false;
+    btn.textContent = "Stop";
+    try {
+      status.textContent = "Loading the playlist's songs…";
+      const { name, tracks } = await getContextTracks(getPlaybackState()?.context);
+      const s = await romanizeTracksNow(tracks, {
+        isCancelled: () => cancelled,
+        onProgress: (p) => {
+          status.textContent = `${name}: checked ${p.checked}/${p.total} · ${p.converted} romanized · ${p.alreadySaved} already saved`;
+          showStorage();
+        },
+      });
+      status.textContent = `${cancelled ? "Stopped." : "Done!"} ${name}: ${s.converted} Japanese song${s.converted === 1 ? "" : "s"} romanized, ` +
+        `${s.alreadySaved} already saved, ${s.notJapanese} don't need it, ${s.noLyrics} have no lyrics` +
+        (s.failed ? `, ${s.failed} failed` : "") + ".";
+    } catch (e) {
+      status.textContent = e.message;
+    }
+    running = false;
+    btn.textContent = "Romanize this playlist now";
+    showStorage();
+  };
+  showStorage();
+}
+
 // ---------- Tracking lyrics for the current song ----------
 /**
  * Keeps lyrics (and romanized title/artist) in sync with the current track.
@@ -331,7 +491,7 @@ export class LyricsTracker {
   }
 
   update(item) {
-    const key = item ? item.id || item.uri || item.name : null;
+    const key = item ? songKey(item) : null;
     if (key === this.key) return;
     this.key = key;
     this.titleRoman = this.artistRoman = null;
@@ -351,33 +511,29 @@ export class LyricsTracker {
     }
     if (!stillCurrent()) return;
 
-    const allText = [item.name, found?.syncedLyrics || found?.plainLyrics || ""].join("\n");
-    const language = detectLanguage(allText);
+    const song = analyzeSong(item, found);
+    const { language, artistText, todo } = song;
 
     if (!found) {
       this.state = { status: "none" };
     } else {
-      const synced = Boolean(found.syncedLyrics);
-      const lines = synced
-        ? parseLrc(found.syncedLyrics)
-        : (found.plainLyrics || "").split(/\r?\n/).map((text) => ({ time: null, text: text.trim() }));
-      const needsRoman = lines.some((l) => NON_LATIN.test(l.text));
       this.state = {
         status: "ready",
-        lyrics: { language, synced, instrumental: Boolean(found.instrumental), lines, romanizing: needsRoman },
+        lyrics: {
+          language, synced: song.synced, instrumental: Boolean(found.instrumental),
+          lines: song.lines, romanizing: todo.length > 0,
+        },
       };
     }
     this.onChange();
 
     // Romanize title/artist and lyrics in the background.
     try {
-      const artistText = item.artists?.map((a) => a.name).join(", ") ?? "";
       const lyrics = this.state.lyrics;
-      const todo = lyrics?.romanizing ? lyrics.lines.filter((l) => NON_LATIN.test(l.text)) : [];
 
-      if (language === "ja" || KANA.test(item.name) || todo.some((l) => KANA.test(l.text))) {
-        // Japanese: title, artist and every lyric line in one request (cached per song).
-        const out = await japaneseSongToRomaji(key, [item.name, artistText, ...todo.map((l) => l.text)]);
+      if (song.japanese) {
+        // Japanese: title, artist and every lyric line in one request (saved per song).
+        const out = await japaneseSongToRomaji(key, song.texts);
         if (!stillCurrent()) return;
         this.titleRoman = out[0];
         this.artistRoman = out[1];
