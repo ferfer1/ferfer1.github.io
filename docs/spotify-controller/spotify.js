@@ -8,6 +8,8 @@ const SCOPES = [
   "user-read-currently-playing",
   "playlist-read-private",
   "playlist-read-collaborative",
+  "playlist-modify-public",   // add songs found by voice search
+  "playlist-modify-private",
 ].join(" ");
 const API = "https://api.spotify.com/v1";
 export const REWIND_MS = 10000;
@@ -119,7 +121,8 @@ export function logout() {
 }
 
 // ---------- API ----------
-async function spotify(method, path, body) {
+// `messages` overrides the error text for specific status codes, e.g. { 403: "..." }.
+async function spotify(method, path, body, messages = {}) {
   const token = await getAccessToken();
   const headers = { Authorization: `Bearer ${token}` };
   if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -132,6 +135,11 @@ async function spotify(method, path, body) {
   if (res.status === 401) { logout(); throw new Error("Spotify session expired. Please log in again."); }
   if (res.status === 204) return null;
   if (!res.ok) {
+    if (messages[res.status]) {
+      const err = new Error(messages[res.status]);
+      err.status = res.status;
+      throw err;
+    }
     if (res.status === 403) throw new Error("Spotify Premium is required to control playback.");
     if (res.status === 404) throw new Error("No active device. Start Spotify somewhere first.");
     let msg = `Spotify error (${res.status})`;
@@ -171,12 +179,84 @@ export async function getPlaylists({ reload = false } = {}) {
     const page = await spotify("GET", path);
     for (const p of page?.items ?? []) {
       if (!p?.uri) continue; // Spotify sometimes returns null entries
-      all.push({ name: p.name || "Untitled playlist", uri: p.uri, image: p.images?.at(-1)?.url || "" });
+      all.push({
+        name: p.name || "Untitled playlist",
+        uri: p.uri,
+        id: p.id || p.uri.split(":").pop(),
+        image: p.images?.at(-1)?.url || "",
+        ownerId: p.owner?.id ?? null,
+        collaborative: Boolean(p.collaborative),
+      });
     }
     path = page?.next ? page.next.replace(API, "") : null;
   }
   playlistCache = all;
   return all;
+}
+
+// ---------- Search & adding songs ----------
+let meCache = null;
+/** The logged-in Spotify user ({ id, display_name, ... }). */
+export async function getMe() {
+  meCache ??= await spotify("GET", "/me");
+  return meCache;
+}
+
+/** Search Spotify for tracks: [{ id, uri, name, artist, image }]. */
+export async function searchTracks(query, limit = 5) {
+  const data = await spotify("GET", `/search?${new URLSearchParams({ q: query, type: "track", limit })}`);
+  return (data?.tracks?.items ?? []).filter(Boolean).map((t) => ({
+    id: t.id,
+    uri: t.uri,
+    name: t.name,
+    artist: t.artists?.map((a) => a.name).join(", ") ?? "",
+    image: t.album?.images?.at(-1)?.url || "",
+  }));
+}
+
+/** Playlists the user can add songs to (ones they own, or collaborative ones). */
+export async function editablePlaylists() {
+  const [me, all] = await Promise.all([getMe(), getPlaylists()]);
+  return all.filter((p) => p.ownerId === me.id || p.collaborative);
+}
+
+/**
+ * The playlist currently playing, if the user can add songs to it: { id, name } or null.
+ * (You can't add to albums, or to playlists someone else owns.)
+ */
+export async function currentEditablePlaylist(playbackState) {
+  const ctx = playbackState?.context;
+  if (ctx?.type !== "playlist" || !ctx.uri) return null;
+  const id = ctx.uri.split(":").pop();
+  try {
+    const [me, info] = await Promise.all([
+      getMe(),
+      spotify("GET", `/playlists/${id}?fields=${encodeURIComponent("id,name,owner(id),collaborative")}`),
+    ]);
+    const canEdit = info?.owner?.id === me.id || info?.collaborative;
+    return canEdit ? { id, name: info.name || "your playlist" } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Add a track to a playlist. */
+export async function addTrackToPlaylist(playlistId, trackUri) {
+  const messages = {
+    403: "You can only add songs to playlists you own or collaborate on.",
+    404: "notfound",
+  };
+  try {
+    return await spotify("POST", `/playlists/${playlistId}/items`, { uris: [trackUri] }, messages);
+  } catch (e) {
+    // Older name of the same endpoint.
+    if (e.status === 404) {
+      return spotify("POST", `/playlists/${playlistId}/tracks`, { uris: [trackUri] }, {
+        403: messages[403], 404: "That playlist wasn't found.",
+      });
+    }
+    throw e;
+  }
 }
 
 // ---------- Playback helpers ----------

@@ -49,11 +49,25 @@
 
       <div id="message" class="hint"></div>
 
+      <div class="lyrics-head">
+        <span>Lyrics</span>
+        <button id="lyrics-toggle" class="switch" role="switch" aria-checked="true">On</button>
+      </div>
+      <div id="lyrics" class="lyrics-box"></div>
+
       <button id="playlists-toggle" class="secondary">Playlists</button>
       <div id="playlists" hidden>
         <input id="playlist-search" type="search" placeholder="Search your playlists" autocomplete="off" />
         <ul id="playlist-list"></ul>
       </div>
+
+      <button id="voice-btn" class="mic">🎤 Find a song by voice</button>
+      <div id="voice-panel" class="voice-panel" hidden>
+        <p id="voice-status"></p>
+        <ul id="voice-results" class="pick-list"></ul>
+        <button id="voice-cancel" class="link">Close</button>
+      </div>
+      <div id="voice-settings"></div>
 
       <a class="link" href="../spotify-controller-glasses/">Glasses version</a>
       <button id="logout" class="link">Disconnect</button>
