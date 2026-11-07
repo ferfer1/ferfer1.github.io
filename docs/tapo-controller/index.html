@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tapo Controller</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>Tapo Controller</h1>
+    <p id="status" class="hint"></p>
+
+    <section id="devices-section" hidden>
+      <div class="row-buttons">
+        <button id="all-on" class="secondary">All on</button>
+        <button id="all-off" class="secondary">All off</button>
+      </div>
+      <ul id="devices"></ul>
+      <button id="rescan" class="link">Refresh device list</button>
+    </section>
+
+    <details id="settings">
+      <summary>Connection settings</summary>
+      <p class="hint">The link shown at the end of setup fills these in for you.</p>
+      <label>Service address <input id="bridge-url" type="url" placeholder="https://tapo-controller.….workers.dev" autocomplete="off" /></label>
+      <label>Key <input id="bridge-key" type="text" placeholder="shown at the end of setup" autocomplete="off" /></label>
+      <p id="settings-warning" class="warn"></p>
+      <button id="save" class="primary">Save &amp; connect</button>
+    </details>
+  </main>
+
+  <template id="device-template">
+    <li class="device">
+      <div class="device-head">
+        <span class="icon"></span>
+        <div class="device-text">
+          <div class="device-name"></div>
+          <small class="device-state"></small>
+        </div>
+        <button class="switch" role="switch"></button>
+      </div>
+      <div class="light-controls" hidden>
+        <label class="slider brightness">☀ <input type="range" min="1" max="100" /></label>
+        <label class="slider temp">🌡 <input type="range" step="100" /></label>
+        <div class="swatches"></div>
+      </div>
+    </li>
+  </template>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
