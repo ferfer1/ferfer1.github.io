@@ -33,6 +33,7 @@ import {
   AudioInputSource,
 } from "./vendor/even_hub_sdk.js";
 import { ART_SIZE, getArt, drawGreenPreview } from "./art.js";
+import { store } from "../spotify-controller/storage.js";
 import {
   redirectUri, getClientId, setClientId, login, handleRedirect, isLoggedIn, logout,
   getPlayback, runAction, PlaybackState, fmtTime, getPlaylists, controls,
@@ -76,12 +77,12 @@ const MENU_TRIM_DEFAULT = 16;
 const MENU_TRIM_STEP = 4;
 const MENU_TRIM_MAX = 60;
 const menuTrim = () => {
-  const v = Number(localStorage.getItem("menu_trim"));
-  return Number.isFinite(v) && localStorage.getItem("menu_trim") !== null ? v : MENU_TRIM_DEFAULT;
+  const saved = store.get("menu_trim");
+  return saved !== null && Number.isFinite(Number(saved)) ? Number(saved) : MENU_TRIM_DEFAULT;
 };
 function changeMenuTrim(delta) {
   const next = Math.min(MENU_TRIM_MAX, Math.max(0, menuTrim() + delta));
-  localStorage.setItem("menu_trim", String(next));
+  store.set("menu_trim", String(next));
   showMenuTrim();
   rebuildPage(); // redraw the glasses with the new height
 }
