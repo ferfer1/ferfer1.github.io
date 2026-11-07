@@ -27,7 +27,7 @@
 
     <!-- Live preview of what the glasses show. Also usable as a remote in a normal browser. -->
     <section id="preview" hidden>
-      <p class="hint">On the glasses: scroll to pick, tap to press, double-tap to go back / exit.</p>
+      <p class="hint">On the glasses: swipe to pick, tap to press, double-tap to go back / exit.</p>
       <div class="lens">
         <div class="lens-top">
           <canvas id="preview-art" width="120" height="120"></canvas>
@@ -36,14 +36,30 @@
         <pre id="preview-lyrics"></pre>
         <ul id="preview-menu"></ul>
       </div>
-      <p class="hint">Preview: ↑/↓ and Enter (Esc = back), or tap an item.</p>
+      <p class="hint">Preview: arrow keys and Enter (Esc = back). Carousel: tap its left/right side to move, middle to press.</p>
+
       <div class="adjust">
-        <span>Menu height on glasses</span>
-        <button id="menu-shorter" class="step" aria-label="Shorter">−</button>
-        <span id="menu-trim"></span>
-        <button id="menu-taller" class="step" aria-label="Taller">+</button>
+        <span>Menu style</span>
+        <button id="style-carousel" class="choice">Carousel</button>
+        <button id="style-list" class="choice">List</button>
       </div>
-      <p class="hint">If the bottom option is cut off on the glasses, tap − until it isn't.</p>
+      <div id="carousel-settings">
+        <div class="adjust">
+          <span>Swipe direction</span>
+          <button id="swipe-direction" class="choice on"></button>
+        </div>
+        <p class="hint">If swiping forward moves the highlight the wrong way, tap to reverse it.
+          If the carousel doesn't respond to swipes at all, switch to List.</p>
+      </div>
+      <div id="list-settings" hidden>
+        <div class="adjust">
+          <span>Menu height on glasses</span>
+          <button id="menu-shorter" class="step" aria-label="Shorter">−</button>
+          <span id="menu-trim"></span>
+          <button id="menu-taller" class="step" aria-label="Taller">+</button>
+        </div>
+        <p class="hint">Normally leave this at "full".</p>
+      </div>
       <div id="romaji-tools"></div>
       <div id="voice-settings"></div>
       <button id="logout" class="link">Disconnect</button>

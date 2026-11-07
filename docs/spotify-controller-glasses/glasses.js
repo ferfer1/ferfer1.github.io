@@ -9,16 +9,16 @@
 //   ├───────┴──────────────────────┤
 //   │ > current lyric line         │  text container "lyrics" (2 lines, romanized;
 //   │   next lyric line            │  hidden when lyrics are turned off)
-//   ├──────────────────────────────┤
-//   │ [Previous]                   │  list container "menu":
-//   │  Rewind 10s                  │  scroll moves the highlight (firmware),
-//   │  Play / Pause                │  tap presses the highlighted item.
-//   │  Skip / Playlists / Lyrics   │
+//   │                              │
+//   │ Rewind  [ Play / Pause ]  Skip│  menu, one of two styles (chosen on the phone):
 //   └──────────────────────────────┘
+//     • Carousel (default): a one-line text box drawn by this app. Swipes move the
+//       highlight left/right, tap presses it. Nothing can be cut off.
+//     • List: the glasses' built-in scrolling list (shows only ~2.5 rows on some glasses).
 //
 // Screens:
-//   controls  – the buttons above. Double-tap exits the app.
-//   playlists – "< Back", up to 18 playlists, "More...". Tap plays; double-tap goes back.
+//   controls  – the buttons. Double-tap exits the app.
+//   playlists – "< Back" + playlists. Tap plays; double-tap goes back.
 import {
   waitForEvenAppBridge,
   CreateStartUpPageContainer,
@@ -58,7 +58,7 @@ const CONTROLS = [
 // Voice-search screens; double-tap on any of them cancels back to the controls.
 const VOICE_SCREENS = ["listening", "searching", "results", "pickPlaylist"];
 
-const PLAYLISTS_PER_PAGE = 18; // + "< Back" + "More..." = 20, the glasses' list limit
+const PLAYLISTS_PER_PAGE = 18; // list style only: + "< Back" + "More..." = 20, the glasses' list limit
 const POLL_MS = 3000;
 const RENDER_MS = 1000;
 const BRIDGE_TIMEOUT_MS = 4000;
@@ -69,11 +69,18 @@ const INFO = { id: 1, name: "info" };
 const LIST = { id: 2, name: "menu" };
 const ART = { id: 3, name: "art" };
 const LYRICS = { id: 4, name: "lyrics" };
+const MENU_TEXT = { id: 5, name: "carousel" }; // the carousel menu's text box
+const MENU_H = 44;                              // carousel box height: one line + border/padding
+const CAROUSEL_WIDTH = 40;                      // characters that fit on the carousel line
 const TEXT_X = ART_SIZE + 8; // info text sits to the right of the album art
 
-// How many pixels to shave off the bottom of the button list. The glasses' row height
-// isn't documented, so this is adjustable from the phone ("Menu height" − / +).
-const MENU_TRIM_DEFAULT = 16;
+// ---------- Menu settings (changed on the phone screen) ----------
+const menuStyle = () => (store.get("menu_style") === "list" ? "list" : "carousel");
+const carousel = () => menuStyle() === "carousel";
+const swipeReversed = () => store.get("swipe_reversed") === "1";
+
+// List style only: pixels to shave off the bottom of the built-in list ("Menu height" − / +).
+const MENU_TRIM_DEFAULT = 0;
 const MENU_TRIM_STEP = 4;
 const MENU_TRIM_MAX = 60;
 const menuTrim = () => {
@@ -118,7 +125,7 @@ function setFlash(text, ms = 2000) {
 }
 
 // ---------- What each screen shows ----------
-/** The list items for the current screen: [{ label, run }]. */
+/** The menu items for the current screen: [{ label, run }]. */
 function currentItems() {
   if (screen === "listening") {
     return [
@@ -136,7 +143,16 @@ function currentItems() {
   if (screen === "pickPlaylist") {
     return [
       { label: "< Cancel", run: () => cancelVoice() },
-      ...voice.playlists.slice(0, 19).map((p) => ({ label: clip(p.name, 40), run: () => addSong(p) })),
+      // The built-in list holds at most 20 items; the carousel has no limit.
+      ...(carousel() ? voice.playlists : voice.playlists.slice(0, 19))
+        .map((p) => ({ label: clip(p.name, 40), run: () => addSong(p) })),
+    ];
+  }
+  if (screen === "playlists" && carousel()) {
+    // Carousel: every playlist in one run, no pages needed.
+    return [
+      { label: "< Back", run: () => setScreen("controls") },
+      ...playlists.map((p) => ({ label: clip(p.name, 40), run: () => playPlaylist(p) })),
     ];
   }
   if (screen === "playlists") {
@@ -209,6 +225,30 @@ function lyricsText() {
   return `> ${currentLines[0]}\n  ${clip(next, width)}`;
 }
 
+/**
+ * The carousel menu line.
+ *   Controls (short labels):   "< Rewind 10s  [ Play / Pause ]  Skip >"
+ *   Long lists (playlists…):   "<  [ Chill Mix ]  >   4/25"
+ */
+function menuText() {
+  const items = currentItems();
+  if (!items.length) return " ";
+  selected = Math.min(selected, items.length - 1);
+  const n = items.length;
+  const current = items[selected].label;
+  if (n === 1) return `[ ${clip(current, CAROUSEL_WIDTH - 4)} ]`;
+
+  if (screen === "controls") {
+    const prev = items[(selected - 1 + n) % n].label;
+    const next = items[(selected + 1) % n].label;
+    const middle = `[ ${clip(current, 20)} ]`;
+    const side = Math.max(4, Math.floor((CAROUSEL_WIDTH - middle.length - 8) / 2));
+    return `< ${clip(prev, side)}  ${middle}  ${clip(next, side)} >`;
+  }
+  const position = `${selected + 1}/${n}`;
+  return `<  [ ${clip(current, CAROUSEL_WIDTH - position.length - 10)} ]  >  ${position}`;
+}
+
 function infoText() {
   // The text area is ~448px wide (beside the album art), so lines are kept short.
   if (!isLoggedIn()) {
@@ -234,6 +274,14 @@ function infoText() {
     return [clip(`Add: ${voice.song?.name ?? ""}`, 28), "Pick a playlist", "Double-tap: cancel", clip(flash, 28)].join("\n");
   }
 
+  if (screen === "playlists" && carousel()) {
+    return [
+      `Playlists (${playlists.length})`,
+      "Swipe to browse",
+      "Tap to play, double-tap: back",
+      clip(flash || (playback.title ? `Now: ${shownTitle()}` : ""), 28),
+    ].join("\n");
+  }
   if (screen === "playlists") {
     const from = playlistOffset + 1;
     const to = Math.min(playlistOffset + PLAYLISTS_PER_PAGE, playlists.length);
@@ -262,9 +310,7 @@ function infoText() {
 
 // ---------- Glasses page ----------
 function pageLayout() {
-  const items = currentItems();
   const showLyrics = lyricsEnabled();
-  const listY = showLyrics ? 186 : 124; // lyrics take 2 lines (62px) above the list
 
   const textObject = [new TextContainerProperty({
     xPosition: TEXT_X, yPosition: 0, width: 576 - TEXT_X, height: 120,
@@ -275,23 +321,38 @@ function pageLayout() {
   })];
   if (showLyrics) {
     textObject.push(new TextContainerProperty({
-      xPosition: 0, yPosition: 122, width: 576, height: 62,
+      xPosition: 0, yPosition: carousel() ? 128 : 122, width: 576, height: 62,
       borderWidth: 0, borderColor: 5, paddingLength: 4,
       containerID: LYRICS.id, containerName: LYRICS.name,
       content: lyricsText(),
       isEventCapture: 0,
     }));
   }
+  const imageObject = [new ImageContainerProperty({
+    xPosition: 0, yPosition: 0, width: ART_SIZE, height: ART_SIZE,
+    containerID: ART.id, containerName: ART.name,
+  })];
 
+  if (carousel()) {
+    // One-line menu box along the bottom; it receives the swipes and taps.
+    textObject.push(new TextContainerProperty({
+      xPosition: 0, yPosition: 288 - MENU_H, width: 576, height: MENU_H,
+      borderWidth: 1, borderColor: 8, borderRadius: 6, paddingLength: 4,
+      containerID: MENU_TEXT.id, containerName: MENU_TEXT.name,
+      content: menuText(),
+      isEventCapture: 1,
+    }));
+    return { containerTotalNum: 1 + textObject.length, imageObject, textObject };
+  }
+
+  const items = currentItems();
+  const listY = showLyrics ? 186 : 124; // lyrics take 2 lines (62px) above the list
   return {
     containerTotalNum: 2 + textObject.length,
-    imageObject: [new ImageContainerProperty({
-      xPosition: 0, yPosition: 0, width: ART_SIZE, height: ART_SIZE,
-      containerID: ART.id, containerName: ART.name,
-    })],
+    imageObject,
     textObject,
     listObject: [new ListContainerProperty({
-      // Shortened by the phone's "Menu height" setting so the bottom row isn't cut off.
+      // Can be shortened with the phone's "Menu height" setting.
       xPosition: 0, yPosition: listY, width: 576, height: Math.max(40, 288 - listY - menuTrim()),
       borderWidth: 0, borderColor: 5, paddingLength: 0,
       containerID: LIST.id, containerName: LIST.name,
@@ -376,6 +437,7 @@ async function pushArt({ resend = false } = {}) {
 const texts = {
   info: { box: INFO, make: infoText, last: "", sending: false, shown: () => true },
   lyrics: { box: LYRICS, make: lyricsText, last: "", sending: false, shown: lyricsEnabled },
+  menu: { box: MENU_TEXT, make: menuText, last: "", sending: false, shown: carousel },
 };
 
 // After a (re)draw, the boxes already contain the current text.
@@ -401,9 +463,18 @@ async function pushText(t) {
 
 function setScreen(next) {
   screen = next;
-  previewIndex = 0;
-  rebuildPage();
-  render();
+  selected = 0;
+  if (!carousel()) rebuildPage(); // the built-in list must be redrawn to change its items
+  render();                       // the carousel just updates its text
+}
+
+/** Carousel: move the highlight by `step` (wraps around at the ends). */
+function moveSelection(step) {
+  const n = currentItems().length;
+  if (!n) return;
+  selected = (((selected + step) % n) + n) % n;
+  renderPreview();
+  pushText(texts.menu);
 }
 
 // ---------- Glasses input ----------
@@ -465,6 +536,23 @@ function handleGlassesEvent(event) {
   if (event.listEvent && listType === OsEventTypeList.CLICK_EVENT) {
     activate(tappedIndex(currentItems(), event.listEvent));
     return;
+  }
+
+  if (carousel()) {
+    // Swipes on the carousel text box arrive as "scroll" events: swipe up = SCROLL_TOP,
+    // swipe down = SCROLL_BOTTOM. Forward/next can be flipped on the phone.
+    const scroll = textType === OsEventTypeList.SCROLL_TOP_EVENT ? -1
+      : textType === OsEventTypeList.SCROLL_BOTTOM_EVENT ? 1 : 0;
+    if (scroll) {
+      if (isRepeat(`swipe${scroll}`, 150)) return; // drop duplicate deliveries of one swipe
+      moveSelection(swipeReversed() ? -scroll : scroll);
+      return;
+    }
+    // A tap: on hardware it comes from the text box; the simulator sends it as a system event.
+    if (textType === OsEventTypeList.CLICK_EVENT || sysType === OsEventTypeList.CLICK_EVENT) {
+      activate(selected);
+      return;
+    }
   }
 
   // Back from the system exit prompt ("No") → redraw our page.
@@ -621,6 +709,28 @@ function toggleLyrics() {
   setFlash(lyricsEnabled() ? "Lyrics on" : "Lyrics off");
 }
 
+// ---------- Menu style & swipe direction (phone screen) ----------
+function setMenuStyle(style) {
+  store.set("menu_style", style);
+  selected = 0;
+  showMenuSettings();
+  rebuildPage(); // swap carousel ⇄ built-in list on the glasses
+  render();
+}
+
+function toggleSwipeDirection() {
+  store.set("swipe_reversed", swipeReversed() ? "0" : "1");
+  showMenuSettings();
+}
+
+function showMenuSettings() {
+  $("style-carousel").classList.toggle("on", carousel());
+  $("style-list").classList.toggle("on", !carousel());
+  $("swipe-direction").textContent = swipeReversed() ? "Reversed" : "Normal";
+  $("carousel-settings").hidden = !carousel();
+  $("list-settings").hidden = carousel();
+}
+
 async function openPlaylists() {
   setFlash("Loading playlists...", 10000);
   try {
@@ -658,19 +768,33 @@ async function refresh() {
 }
 
 // ---------- Phone screen / browser preview ----------
-let previewIndex = 0;
+let selected = 0; // highlighted menu item (carousel) / preview highlight (list)
 
 function renderPreview() {
   $("preview-info").textContent = infoText();
   renderPreviewLyrics();
   const items = currentItems();
-  previewIndex = Math.min(previewIndex, items.length - 1);
+  selected = Math.max(0, Math.min(selected, items.length - 1));
   const ul = $("preview-menu");
+
+  if (carousel()) {
+    // Same one-line text the glasses show. Click the left/right third to move, middle to press.
+    const li = document.createElement("li");
+    li.className = "selected carousel";
+    li.textContent = menuText();
+    li.onclick = (e) => {
+      const x = (e.offsetX ?? 0) / (li.clientWidth || 1);
+      if (x < 1 / 3) moveSelection(-1); else if (x > 2 / 3) moveSelection(1); else activate(selected);
+    };
+    ul.replaceChildren(li);
+    return;
+  }
+
   ul.replaceChildren(...items.map((item, i) => {
     const li = document.createElement("li");
     li.textContent = item.label;
-    li.classList.toggle("selected", i === previewIndex);
-    li.onclick = () => { previewIndex = i; activate(i); };
+    li.classList.toggle("selected", i === selected);
+    li.onclick = () => { selected = i; activate(i); };
     return li;
   }));
 }
@@ -685,6 +809,7 @@ function render() {
   renderPreview();
   pushText(texts.info);
   pushText(texts.lyrics);
+  pushText(texts.menu);
   syncArt();
 }
 
@@ -733,18 +858,27 @@ async function init() {
   $("menu-taller").onclick = () => changeMenuTrim(-MENU_TRIM_STEP);
   showMenuTrim();
 
-  // Keyboard stand-ins for the glasses: ↑/↓ scroll, Enter = tap, Esc = double-tap.
+  // Keyboard stand-ins for the glasses: arrows = swipe, Enter = tap, Esc = double-tap.
   document.addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT") return;
-    const last = currentItems().length - 1;
-    if (e.key === "ArrowUp") previewIndex = Math.max(0, previewIndex - 1);
-    else if (e.key === "ArrowDown") previewIndex = Math.min(last, previewIndex + 1);
-    else if (e.key === "Enter") activate(previewIndex);
+    const back = e.key === "ArrowUp" || e.key === "ArrowLeft";
+    const forward = e.key === "ArrowDown" || e.key === "ArrowRight";
+    if (back || forward) {
+      const step = back ? -1 : 1;
+      if (carousel()) moveSelection(step);
+      else selected = Math.max(0, Math.min(currentItems().length - 1, selected + step));
+    } else if (e.key === "Enter") activate(selected);
     else if (e.key === "Escape") { if (screen !== "controls") setScreen("controls"); }
     else return;
     e.preventDefault();
     renderPreview();
   });
+
+  // Menu style & swipe direction
+  $("style-carousel").onclick = () => setMenuStyle("carousel");
+  $("style-list").onclick = () => setMenuStyle("list");
+  $("swipe-direction").onclick = toggleSwipeDirection;
+  showMenuSettings();
 
   if (getClientId()) {
     try { await handleRedirect(); } catch (e) { alert(e.message); }

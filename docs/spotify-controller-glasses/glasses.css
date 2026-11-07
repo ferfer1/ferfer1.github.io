@@ -60,6 +60,24 @@ button.step {
 }
 button.step:hover { border-color: #fff; }
 
+button.choice {
+  padding: 6px 14px;
+  border: 1px solid #535353;
+  border-radius: 999px;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+button.choice.on { background: #1db954; border-color: #1db954; color: #000; }
+
+/* Carousel preview: one bordered line along the bottom, like on the glasses. */
+#preview-menu li.carousel {
+  white-space: pre;
+  overflow: hidden;
+  text-align: center;
+  cursor: pointer;
+  user-select: none;
+}
+
 #preview-menu {
   list-style: none;
   margin: 0;
