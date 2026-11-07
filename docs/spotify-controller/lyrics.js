@@ -46,19 +46,45 @@ function loadScript(src) {
   return scripts.get(src);
 }
 
-let kuroshiroReady = null;
-function getKuroshiro() {
-  kuroshiroReady ??= (async () => {
-    await loadScript(vendor("kuroshiro.min.js"));
-    await loadScript(vendor("kuroshiro-analyzer-kuromoji.min.js"));
-    const Kuroshiro = window.Kuroshiro.default || window.Kuroshiro;
-    const Analyzer = window.KuromojiAnalyzer.default || window.KuromojiAnalyzer;
-    const k = new Kuroshiro();
-    await k.init(new Analyzer({ dictPath: KUROMOJI_DICT })); // ~12 MB, downloaded once then cached
-    return k;
-  })();
-  kuroshiroReady.catch(() => { kuroshiroReady = null; }); // allow a retry later
-  return kuroshiroReady;
+// Japanese is converted in a background worker (romaji-worker.js): loading the
+// ~12 MB dictionary on the main thread froze the page, especially on phones.
+const ROMAJI_TIMEOUT_MS = 90000; // first use downloads the dictionary; give up after this
+let romajiWorker = null;
+let romajiJobId = 0;
+const romajiJobs = new Map();
+
+function getRomajiWorker() {
+  if (!romajiWorker) {
+    romajiWorker = new Worker(new URL("./romaji-worker.js", import.meta.url));
+    romajiWorker.onmessage = ({ data }) => {
+      const job = romajiJobs.get(data.id);
+      if (!job) return;
+      romajiJobs.delete(data.id);
+      clearTimeout(job.timer);
+      data.error ? job.reject(new Error(data.error)) : job.resolve(data.out);
+    };
+    romajiWorker.onerror = (e) => {
+      // Worker crashed or couldn't load: fail every waiting job and start fresh next time.
+      for (const job of romajiJobs.values()) { clearTimeout(job.timer); job.reject(new Error(e.message || "Romaji worker failed")); }
+      romajiJobs.clear();
+      romajiWorker?.terminate();
+      romajiWorker = null;
+    };
+  }
+  return romajiWorker;
+}
+
+/** Convert many Japanese texts to romaji in one go (in the background). */
+function japaneseBatchToRomaji(texts) {
+  return new Promise((resolve, reject) => {
+    const id = ++romajiJobId;
+    const timer = setTimeout(() => {
+      romajiJobs.delete(id);
+      reject(new Error("Romaji conversion took too long"));
+    }, ROMAJI_TIMEOUT_MS);
+    romajiJobs.set(id, { resolve, reject, timer });
+    getRomajiWorker().postMessage({ id, texts, dictPath: KUROMOJI_DICT });
+  }).then((out) => out.map(tidy));
 }
 
 let pinyinReady = null;
@@ -78,8 +104,7 @@ const tidy = (s) => s
   .trim();
 
 async function japaneseToRomaji(text) {
-  const k = await getKuroshiro();
-  return tidy(await k.convert(text, { to: "romaji", mode: "spaced", romajiSystem: "hepburn" }));
+  return (await japaneseBatchToRomaji([text]))[0];
 }
 
 async function chineseToPinyin(text) {
@@ -259,9 +284,17 @@ export class LyricsTracker {
 
       const lyrics = this.state.lyrics;
       if (lyrics?.romanizing) {
-        for (const line of lyrics.lines) {
-          line.roman = await romanize(line.text, language);
+        const todo = lyrics.lines.filter((l) => NON_LATIN.test(l.text));
+        if (language === "ja" || todo.some((l) => KANA.test(l.text))) {
+          // One background batch for the whole song.
+          const romaji = await japaneseBatchToRomaji(todo.map((l) => l.text));
           if (!stillCurrent()) return;
+          todo.forEach((line, i) => { line.roman = romaji[i]; });
+        } else {
+          for (const line of todo) {
+            line.roman = await romanize(line.text, language);
+            if (!stillCurrent()) return;
+          }
         }
         lyrics.romanizing = false;
         this.onChange();
