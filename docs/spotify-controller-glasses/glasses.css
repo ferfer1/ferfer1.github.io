@@ -41,6 +41,25 @@
   overflow: hidden;
 }
 
+.adjust {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 12px;
+  font-size: 0.9rem;
+}
+.adjust #menu-trim { min-width: 54px; color: #1db954; font-weight: 700; }
+button.step {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid #535353;
+  font-size: 1.2rem;
+  line-height: 1;
+}
+button.step:hover { border-color: #fff; }
+
 #preview-menu {
   list-style: none;
   margin: 0;

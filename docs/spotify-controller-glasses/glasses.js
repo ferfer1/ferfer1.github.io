@@ -70,6 +70,25 @@ const ART = { id: 3, name: "art" };
 const LYRICS = { id: 4, name: "lyrics" };
 const TEXT_X = ART_SIZE + 8; // info text sits to the right of the album art
 
+// How many pixels to shave off the bottom of the button list. The glasses' row height
+// isn't documented, so this is adjustable from the phone ("Menu height" − / +).
+const MENU_TRIM_DEFAULT = 16;
+const MENU_TRIM_STEP = 4;
+const MENU_TRIM_MAX = 60;
+const menuTrim = () => {
+  const v = Number(localStorage.getItem("menu_trim"));
+  return Number.isFinite(v) && localStorage.getItem("menu_trim") !== null ? v : MENU_TRIM_DEFAULT;
+};
+function changeMenuTrim(delta) {
+  const next = Math.min(MENU_TRIM_MAX, Math.max(0, menuTrim() + delta));
+  localStorage.setItem("menu_trim", String(next));
+  showMenuTrim();
+  rebuildPage(); // redraw the glasses with the new height
+}
+function showMenuTrim() {
+  $("menu-trim").textContent = menuTrim() === 0 ? "full" : `−${menuTrim()}px`;
+}
+
 const $ = (id) => document.getElementById(id);
 const playback = new PlaybackState();
 const lyrics = new LyricsTracker(() => render());
@@ -271,8 +290,9 @@ function pageLayout() {
     })],
     textObject,
     listObject: [new ListContainerProperty({
-      xPosition: 0, yPosition: listY, width: 576, height: 288 - listY,
-      borderWidth: 0, borderColor: 5, paddingLength: 4,
+      // Shortened by the phone's "Menu height" setting so the bottom row isn't cut off.
+      xPosition: 0, yPosition: listY, width: 576, height: Math.max(40, 288 - listY - menuTrim()),
+      borderWidth: 0, borderColor: 5, paddingLength: 0,
       containerID: LIST.id, containerName: LIST.name,
       isEventCapture: 1, // the list receives scroll + tap
       itemContainer: new ListItemContainerProperty({
@@ -706,6 +726,10 @@ async function init() {
   $("login-btn").onclick = login;
   $("logout").onclick = () => { logout(); location.reload(); };
   mountVoiceSettings($("voice-settings"));
+  // "Menu height": − makes the button list shorter (use it if the bottom row is cut off).
+  $("menu-shorter").onclick = () => changeMenuTrim(MENU_TRIM_STEP);
+  $("menu-taller").onclick = () => changeMenuTrim(-MENU_TRIM_STEP);
+  showMenuTrim();
 
   // Keyboard stand-ins for the glasses: ↑/↓ scroll, Enter = tap, Esc = double-tap.
   document.addEventListener("keydown", (e) => {
