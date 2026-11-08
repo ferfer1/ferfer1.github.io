@@ -1,1 +1,0 @@
-﻿g2_font_measure.js is @evenrealities/pretext 0.1.4 (dist/font_measure.js) by Even Realities, published under the MIT License (see the package on npm: https://www.npmjs.com/package/@evenrealities/pretext).
