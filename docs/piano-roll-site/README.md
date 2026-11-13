@@ -5,8 +5,9 @@ A MIDI viewer that scrolls notes right to left or drops them top to bottom onto 
 ## Put it on GitHub Pages
 
 1. Create a new public repository on GitHub, for example `piano-roll`.
-2. Upload **everything in this folder** to the repository root, keeping the folder structure (`index.html`, `js/`, `model/`, `vendor/`, `.nojekyll`).
-   - On the website: **Add file → Upload files**, then drag the folder's contents in. The model file is 49 MB, which is under GitHub's 100 MB per-file limit. GitHub may show a warning for files over 50 MB, but this one is under that too.
+2. Upload **everything in this folder** to the repository root, keeping the folder structure (`index.html`, `coi-sw.js`, `js/`, `model/`, `vendor/`, `.nojekyll`).
+   - On the website: **Add file → Upload files**, then drag the folder's contents in. Every file is under GitHub's 25 MB upload limit. The 49 MB model is stored as three pieces (`model/piano_note_fp16.part1.bin` to `part3.bin`), and the page joins them back together. All three must be uploaded.
+   - Files whose names start with a dot, such as `.nojekyll`, are hidden in some file browsers, and drag-and-drop can skip them. If yours is missing after uploading, create it on GitHub with **Add file → Create new file**, name it `.nojekyll` and leave it empty.
    - Or with git:
      ```bash
      git init
